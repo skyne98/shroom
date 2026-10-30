@@ -740,11 +740,16 @@ fn summary_row(lines: &[Line], work: &[(usize, usize, Role)], width: usize, mark
     } else {
         titles.join(", ")
     };
-    let mut right = vec![run(meta.join(" · "), Paint::fg(NIGHT.muted))];
+    // The window draws the summary in the prose face; the terminal in cells.
+    let sans = |paint: Paint| if pixels() { paint.sans() } else { paint };
+    let mut right = vec![run(meta.join(" · "), sans(Paint::fg(NIGHT.muted)))];
     if failed > 0 {
-        right.push(run(format!(" · {failed} failed"), Paint::fg(NIGHT.error)));
+        right.push(run(
+            format!(" · {failed} failed"),
+            sans(Paint::fg(NIGHT.error)),
+        ));
     }
-    spread(vec![run(mark, DIM), run(left, DIM)], right, width)
+    spread(vec![run(mark, DIM), run(left, sans(DIM))], right, width)
 }
 
 const THOUGHT: Paint = Paint {
@@ -752,6 +757,19 @@ const THOUGHT: Paint = Paint {
     face: Face::Sans,
     ..DIM
 };
+
+/// Reasoning text: italic in the terminal (it needs the cue); in the window
+/// upright and muted, which reads far easier in long passages.
+fn thought() -> Paint {
+    if pixels() {
+        Paint {
+            face: Face::Sans,
+            ..Paint::fg(NIGHT.muted)
+        }
+    } else {
+        THOUGHT
+    }
+}
 
 /// Reasoning: dim italic under a `✻` gutter, or one summary row when hidden.
 fn thinking_rows(lines: &[Line], width: usize, show: bool, live: bool) -> Vec<Row> {
@@ -763,7 +781,7 @@ fn thinking_rows(lines: &[Line], width: usize, show: bool, live: bool) -> Vec<Ro
         let label = if live { "thinking…" } else { "thought" };
         let mut rows = vec![vec![
             run("✻ ", DIM),
-            run(format!("{label} · {words} words"), THOUGHT),
+            run(format!("{label} · {words} words"), thought()),
         ]];
         // Thinking now: its last few lines, so it is visibly moving.
         if live {
@@ -772,7 +790,7 @@ fn thinking_rows(lines: &[Line], width: usize, show: bool, live: bool) -> Vec<Ro
                 tail.extend(wrap(
                     vec![run("  ", DIM)],
                     vec![run("  ", DIM)],
-                    vec![run(line.text.clone(), THOUGHT)],
+                    vec![run(line.text.clone(), thought())],
                     width,
                     None,
                 ));
@@ -788,7 +806,7 @@ fn thinking_rows(lines: &[Line], width: usize, show: bool, live: bool) -> Vec<Ro
         rows.extend(wrap(
             vec![gutter],
             vec![run("  ", DIM)],
-            vec![run(line.text.clone(), THOUGHT)],
+            vec![run(line.text.clone(), thought())],
             width,
             None,
         ));
@@ -960,7 +978,7 @@ fn agent_rows(lines: &[Line], width: usize) -> Vec<Row> {
     } else if !activity.is_empty() {
         rows.push(vec![
             rail(),
-            run(clip(activity, width.saturating_sub(2)), THOUGHT),
+            run(clip(activity, width.saturating_sub(2)), thought()),
         ]);
     }
     rows
@@ -1044,16 +1062,22 @@ pub fn image_row(text: &str, width: usize) -> Row {
 /// `left` then `right` flush right on one row of `width`; the last run of
 /// `left` is clipped with `…` to make room.
 fn spread(mut left: Row, right: Row, width: usize) -> Row {
-    let right_width = self::width(&right);
-    let room = width.saturating_sub(right_width + 2);
-    let fixed: usize = left.iter().rev().skip(1).map(|run| run.text.width()).sum();
+    // Drawn widths (prose is proportional in the window), padded in cells.
+    let drawn = |row: &[Run]| {
+        row.iter()
+            .map(|run| text_width(&run.text, run.paint))
+            .sum::<f32>()
+    };
+    let right_width = drawn(&right).ceil() as usize;
+    let room = width.saturating_sub(right_width + 2) as f32;
+    let fixed = drawn(&left[..left.len().saturating_sub(1)]);
     if let Some(last) = left.last_mut()
-        && fixed + last.text.width() > room
+        && fixed + text_width(&last.text, last.paint) > room
     {
-        let keep = room.saturating_sub(fixed + 1);
-        last.text = format!("{}…", clip(&last.text, keep));
+        let keep = (room - fixed - 1.0).max(0.0);
+        last.text = format!("{}…", fit_prefix(&last.text, last.paint, keep));
     }
-    let used = self::width(&left);
+    let used = drawn(&left).ceil() as usize;
     left.push(run(
         " ".repeat(width.saturating_sub(used + right_width)),
         TEXT,

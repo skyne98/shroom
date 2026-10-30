@@ -159,6 +159,11 @@ impl State {
 
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
+            // Paragraphs are separated by one blank row (list items stay tight).
+            Tag::Paragraph if self.lists.is_empty() => {
+                self.flush();
+                self.blank();
+            }
             Tag::Strong => self.bold += 1,
             Tag::Emphasis => self.italic += 1,
             Tag::Strikethrough => self.strike += 1,
@@ -315,7 +320,14 @@ impl State {
     /// Emit the buffered table: padded columns, bold header, one rule under it.
     /// Too wide for the pane: the widest column shrinks and cells end in `…`.
     fn table_blocks(&mut self, width: usize) {
-        let rows = std::mem::take(&mut self.rows);
+        let mut rows = std::mem::take(&mut self.rows);
+        // A header with no text (`| | |`): drop it and its rule.
+        let headless = rows
+            .first()
+            .is_some_and(|row| row.iter().all(|cell| cell.trim().is_empty()));
+        if headless {
+            rows.remove(0);
+        }
         let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
         if columns == 0 {
             return;
@@ -355,7 +367,11 @@ impl State {
                 } else {
                     format!("{cell}{gap}")
                 };
-                let ink = if index == 0 { Ink::Bold } else { Ink::Plain };
+                let ink = if index == 0 && !headless {
+                    Ink::Bold
+                } else {
+                    Ink::Plain
+                };
                 spans.push(Span { ink, text });
             }
             let spans = self.quoted(spans);
@@ -365,7 +381,7 @@ impl State {
                 code: false,
                 mono: true,
             });
-            if index == 0 {
+            if index == 0 && !headless {
                 let rule = widths
                     .iter()
                     .map(|&w| "─".repeat(w))
@@ -484,6 +500,26 @@ fn fit(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paragraphs_get_a_blank_row_between_them() {
+        let blocks = super::render("One.\n\n**Two** (x)\nmore.\n\nThree.", 40);
+        let texts: Vec<String> = blocks
+            .iter()
+            .map(|b| b.spans.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, ["One.", "", "Two (x) more.", "", "Three."]);
+    }
+
+    #[test]
+    fn a_table_with_an_empty_header_drops_it_and_its_rule() {
+        let blocks = super::render("| | |\n|---|---|\n| a | b |", 40);
+        let texts: Vec<String> = blocks
+            .iter()
+            .map(|b| b.spans.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, ["a │ b"]);
+    }
+
     #[test]
     fn nested_lists_have_no_gaps() {
         let lines: Vec<String> =
