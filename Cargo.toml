@@ -26,13 +26,14 @@ extism = "1"
 genai = { version = "0.7.0-rc.8", default-features = false, features = ["system-proxy"] }
 ratatui = "0.29"
 crossterm = "0.28"
-gpui = { git = "https://github.com/zeronsh/zui", rev = "361ff20b919fdfb80199ee6d9aed725300cb7d54" }
-gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "361ff20b919fdfb80199ee6d9aed725300cb7d54", features = [
+gpui = { git = "https://github.com/zeronsh/zui", rev = "b564a34413bb7ef1da04121c4a287758f94993d9" }
+gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "b564a34413bb7ef1da04121c4a287758f94993d9", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
+gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "59f89243cea79dd70eb7a619b3930c374ef6958a" }
 
 [profile.dev.package."*"]
 # gpui and wasmtime are unusable unoptimized; match zed's approach.

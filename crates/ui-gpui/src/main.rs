@@ -12,7 +12,7 @@ use gpui::{
     FontStyle, FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ObjectFit, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString,
     StrikethroughStyle, StyledText, Task, TextRun, UnderlineStyle, Window, WindowBounds,
-    WindowOptions, div, font, img, prelude::*, px, rgb, size,
+    WindowOptions, canvas, div, font, hsla, img, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use shroom_ui::NIGHT;
@@ -835,12 +835,23 @@ fn popup(view: Popup, m: Metrics, cx: &mut Context<Root>) -> impl IntoElement {
     div()
         .absolute()
         .inset_0()
-        // Black at 60%: the chat recedes, the dialog is the one thing to read.
-        .bg(gpui::rgba((0x99 as f32 * open) as u32))
         .flex()
         .items_start()
         .justify_center()
         .pt(px(96. * m.zoom))
+        // The window behind the dialog is blurred, then dimmed: the card is
+        // the one sharp thing on screen (gpui backdrop blur, wgpu on Linux).
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, (), window, _| {
+                    window.paint_backdrop_blur(bounds, gpui::Corners::all(px(0.)), px(5. * m.zoom));
+                    window.paint_quad(gpui::fill(bounds, hsla(0., 0., 0., 0.28 * open)));
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
         .child(
             div()
                 .id("dialog")
@@ -1690,9 +1701,10 @@ fn send_button(generating: bool, m: Metrics, cx: &mut Context<Root>) -> impl Int
     } else {
         ("Send", "↑", NIGHT.accent)
     };
-    div()
-        .id("send")
-        .role(gpui::Role::Button)
+    let root = cx.entity();
+    // gpui-base's button owns pointer, Enter/Space and focus behaviour; the
+    // look stays shroom's.
+    gpui_base::Button::new("send")
         .aria_label(label)
         .aria_keyshortcuts(if generating { "Escape" } else { "Enter" })
         .flex_none()
@@ -1706,15 +1718,17 @@ fn send_button(generating: bool, m: Metrics, cx: &mut Context<Root>) -> impl Int
         .text_size(px(15. * z))
         .text_color(color(NIGHT.bg))
         .cursor_pointer()
-        .on_click(cx.listener(move |root, _, _, cx| {
-            if generating {
-                root.chat.stop();
-            } else {
-                let outcome = root.chat.key(Key::Enter, Mods::default());
-                root.apply(outcome, cx);
-            }
-            cx.notify();
-        }))
+        .on_click(move |_, _, cx| {
+            root.update(cx, |root, cx| {
+                if generating {
+                    root.chat.stop();
+                } else {
+                    let outcome = root.chat.key(Key::Enter, Mods::default());
+                    root.apply(outcome, cx);
+                }
+                cx.notify();
+            });
+        })
         .child(glyph)
 }
 
