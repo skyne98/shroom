@@ -26,8 +26,8 @@ const SANS: &str = "Shroom Sans";
 /// Base metrics at zoom 1; everything scales with `Root::zoom`.
 const FONT_SIZE: f32 = 14.;
 /// Prose a touch larger than code, as in every editor's markdown preview.
-const SANS_SIZE: f32 = 14.5;
-const LINE_HEIGHT: f32 = 21.;
+const SANS_SIZE: f32 = 14.;
+const LINE_HEIGHT: f32 = 22.;
 const PAD: f32 = 16.;
 const ZOOM_STEP: f32 = 1.1;
 /// The reading column in mono cells (~700 px at zoom 1), as in zeron.
@@ -581,9 +581,9 @@ fn styled(cells: Row) -> StyledText {
 /// Prose size per face at zoom 1.
 fn sans_size(face: Face) -> f32 {
     match face {
-        Face::Title(1) => 20.,
-        Face::Title(2) => 17.,
-        Face::Title(_) => 15.5,
+        Face::Title(1) => 19.,
+        Face::Title(2) => 16.,
+        Face::Title(_) => 15.,
         _ => SANS_SIZE,
     }
 }

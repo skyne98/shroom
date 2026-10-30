@@ -170,6 +170,9 @@ pub fn width(row: &[Run]) -> usize {
     row.iter().map(|run| run.text.width()).sum()
 }
 
+/// Inline code's plate in the window (a warm wash of the code colour).
+pub const CODE_WASH: u32 = 0x26231c;
+
 pub fn ink(ink: Ink) -> Paint {
     match ink {
         Ink::Plain => TEXT.sans(),
@@ -181,10 +184,20 @@ pub fn ink(ink: Ink) -> Paint {
         },
         // Colour alone marks inline code: a background on every file name
         // made answers look striped.
+        // The window can afford a faint plate behind it, as zeron does.
+        Ink::Code if pixels() => Paint {
+            bg: Some(CODE_WASH),
+            ..Paint::fg(NIGHT.code)
+        },
         Ink::Code => Paint::fg(NIGHT.code),
         Ink::Syntax(token) => Paint::fg(syntax(token)),
         // Four visible tiers: underlined accent, accent, bright, dim; the
         // window also draws the first three larger.
+        // The window sizes headings, so they stay monochrome and bold there.
+        Ink::Heading(level @ 1..=3) if pixels() => Paint {
+            face: Face::Title(level),
+            ..TEXT.bold()
+        },
         Ink::Heading(1) => Paint {
             underline: true,
             face: Face::Title(1),
@@ -1102,10 +1115,22 @@ pub fn answer_rows(text: &str, width: usize, copy: Option<&str>) -> Laid {
                     && span.text.len() <= 5
                     && !is_bar(span)
             });
-        if item && last_item.is_some_and(|rows| rows > 1) {
+        // The window: H1's underline rule is the heading's size instead.
+        if pixels()
+            && block.mono
+            && block
+                .spans
+                .iter()
+                .all(|span| span.text.chars().all(|c| c == '━'))
+        {
+            continue;
+        }
+        // Long items get a blank row of air in the terminal; the window keeps
+        // a list tight, as zeron does.
+        if item && last_item.is_some_and(|rows| rows > 1) && !pixels() {
             rows.push(Row::new());
         }
-        let marker = if index == 1 {
+        let marker = if index == 1 && !pixels() {
             run("● ", ACCENT)
         } else {
             run("  ", TEXT)
@@ -1126,25 +1151,46 @@ pub fn answer_rows(text: &str, width: usize, copy: Option<&str>) -> Laid {
             .take_while(|span| is_bar(span))
             .map(|span| run(span.text.clone(), ink(span.ink)))
             .collect();
-        let hang = if quote.is_empty() {
-            vec![run(" ".repeat(2 + block.indent + bullet), TEXT)]
+        // The window starts a top-level list's markers at the text's edge.
+        let indent = if pixels() {
+            block.indent.saturating_sub(2)
         } else {
-            let mut hang = vec![run(" ".repeat(2 + block.indent), TEXT)];
+            block.indent
+        };
+        let hang = if quote.is_empty() {
+            vec![run(" ".repeat(2 + indent + bullet), TEXT)]
+        } else {
+            let mut hang = vec![run(" ".repeat(2 + indent), TEXT)];
             hang.extend(quote);
             hang
         };
         let body = block
             .spans
             .iter()
-            .map(|span| {
+            .enumerate()
+            .map(|(at, span)| {
                 let mut paint = ink(span.ink);
                 if block.mono {
                     paint.face = Face::Mono;
                 }
+                // List numbers and bullets in the accent, like zeron.
+                if at == 0 && bullet > 0 {
+                    paint = ACCENT;
+                }
+                // The window's tables are frameless: no column bars, the
+                // header rule a faint hairline.
+                if pixels() && block.mono && span.ink == Ink::Dim {
+                    if span.text == " │ " {
+                        return run("   ", paint);
+                    }
+                    if span.text.chars().all(|c| matches!(c, '─' | '┼')) {
+                        return run(span.text.replace('┼', "─"), Paint::fg(NIGHT.faint));
+                    }
+                }
                 run(span.text.clone(), paint)
             })
             .collect();
-        let first = vec![marker, run(" ".repeat(block.indent), TEXT)];
+        let first = vec![marker, run(" ".repeat(indent), TEXT)];
         let measure = if block.mono { width } else { prose };
         let before = rows.len();
         rows.extend(wrap(first, hang, body, measure, None));
