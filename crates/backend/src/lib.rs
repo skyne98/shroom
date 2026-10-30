@@ -6,6 +6,7 @@
 mod agent;
 pub mod agents;
 pub mod compact;
+pub mod git;
 
 pub use agent::{Agent, Inbox, Run, Update, drain};
 pub use agents::Agents;

@@ -75,6 +75,9 @@ pub struct Limits {
     /// `write` and `edit` refuse (`sh` still runs: this guards mistakes,
     /// it is not a sandbox).
     pub read_only: bool,
+    /// `write` and `edit` refuse paths outside the root folder (an agent
+    /// in its own worktree). Same caveat: `sh` is not confined.
+    pub confine: bool,
 }
 
 impl Default for Limits {
@@ -83,6 +86,7 @@ impl Default for Limits {
             timeout: Duration::from_secs(600),
             memory: 256 << 20,
             read_only: false,
+            confine: false,
         }
     }
 }
@@ -114,6 +118,7 @@ struct Env {
     cwd: PathBuf,
     log: UnboundedSender<Call>,
     read_only: bool,
+    confine: bool,
     host: Option<Arc<dyn Host>>,
     /// Finished calls, for the "what already happened" footer after an error.
     done: std::sync::Mutex<Vec<Call>>,
@@ -161,6 +166,7 @@ pub async fn run_with(
         cwd: cwd.to_path_buf(),
         log,
         read_only: limits.read_only,
+        confine: limits.confine,
         host,
         done: std::sync::Mutex::new(Vec::new()),
         shown: std::sync::Mutex::new(Vec::new()),
@@ -494,6 +500,11 @@ async fn dispatch(env: &Env, id: usize, name: &str, args: &str) -> Value {
         },
         "read" => read(env, &text(0), args.get(1)),
         "write" | "edit" if env.read_only => refuse(),
+        "write" | "edit" if env.confine && !inside(env, &text(0)) => Err(format!(
+            "{} is outside your worktree {}; change files only inside it",
+            text(0),
+            env.cwd.display()
+        )),
         "write" => write(env, &text(0), &text(1)),
         "edit" => edit(env, &text(0), &text(1), &text(2), args.get(3)),
         "ls" => ls(env, &target),
@@ -531,6 +542,25 @@ fn path(env: &Env, path: &str) -> Result<PathBuf, String> {
         return Ok(PathBuf::from(home).join(rest));
     }
     Ok(env.cwd.join(path))
+}
+
+/// `file` resolves inside the root folder (`..` and `.` folded away, no
+/// file system access: a file that does not exist yet counts too).
+fn inside(env: &Env, file: &str) -> bool {
+    let Ok(full) = path(env, file) else {
+        return false;
+    };
+    let mut folded = PathBuf::new();
+    for part in full.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                folded.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => folded.push(other),
+        }
+    }
+    folded.starts_with(&env.cwd)
 }
 
 /// "no such file" plus up to five look-alike names from the same directory.
@@ -982,6 +1012,37 @@ mod tests {
             outcome.text
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn confined_writes_stay_inside_the_root() {
+        let dir = temp();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = run_with(
+            "await write('in/a.txt', 'x'); \
+             let up; try { await write('../escape.txt', 'x') } catch (x) { up = x.message } \
+             let abs; try { await write('/tmp/smash-escape.txt', 'x') } catch (x) { abs = x.message } \
+             await write('in/../b.txt', 'y'); return [up, abs]",
+            &dir,
+            Limits {
+                timeout: Duration::from_secs(5),
+                confine: true,
+                ..Limits::default()
+            },
+            tx,
+            None,
+        )
+        .await;
+        assert!(outcome.error.is_none(), "{}", outcome.text);
+        assert!(dir.join("in/a.txt").exists() && dir.join("b.txt").exists());
+        assert_eq!(
+            outcome.text.matches("outside your worktree").count(),
+            2,
+            "{}",
+            outcome.text
+        );
+        assert!(!dir.parent().unwrap().join("escape.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

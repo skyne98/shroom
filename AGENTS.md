@@ -35,7 +35,7 @@ animation, identical in the terminal and the window. No visible value jumps.
   that it settles within its bound, and that it ends exactly at the new state.
 
 Animated today: transcript scroll (glide, keeps its place when content arrives
-while scrolled up), new rows (fade in), session switch and relayout (fade in),
+while scrolled up), new rows (fade in), session switch, relayout and rewind (fade in),
 popup (unfolds with a pop, folds away), picker highlight (fades onto the item),
 notices (fade in), ctx meter (counts), prompt box height (grows or shrinks a row
 at a time), scrollbar thumb (follows the shown scroll), image previews (fade

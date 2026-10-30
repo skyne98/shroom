@@ -18,7 +18,7 @@ use smash_backend::agents::{
 };
 use smash_backend::{
     Agent, Agents, CancellationToken, Compactor, Files, Inbox, Run, Summarizer,
-    Update as AgentUpdate,
+    Update as AgentUpdate, git,
 };
 use smash_client::Client;
 use smash_core::Action;
@@ -157,6 +157,9 @@ struct Job {
     inbox: Inbox,
     /// For subagents: which models exist.
     catalog: Catalog,
+    /// The session's checkpoint folder and this prompt's mark: the files
+    /// are snapshotted around the run (rewind).
+    checkpoint: (PathBuf, git::Mark),
 }
 
 enum Msg {
@@ -212,8 +215,13 @@ impl Worker {
                     summarizers,
                     inbox: steer,
                     catalog,
+                    checkpoint: (marks, mark),
                 } = job;
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                // ponytail: the first snapshot of a session hashes the checkout
+                // once (git's stat cache makes later ones ~1 ms); a big repo
+                // with large unignored files delays its first answer.
+                let turn = git::begin_turn(&marks, &cwd, mark);
                 let (chat_key, chat_model, chat_window) = (key.clone(), model.clone(), window);
                 let spec = Spec {
                     cwd,
@@ -252,6 +260,9 @@ impl Worker {
                     let (done, ()) = tokio::join!(run, forward);
                     done
                 });
+                if let Some(turn) = turn {
+                    git::end_turn(&marks, turn);
+                }
                 if outbox
                     .send(Msg::Done {
                         doc,
@@ -984,6 +995,10 @@ enum Pick {
     Commands,
     /// The name field of a session being renamed.
     Rename,
+    /// This session's prompts, newest first: pick one to go back to.
+    Rewind,
+    /// What to restore of the prompt picked in [`Pick::Rewind`].
+    RewindHow,
 }
 
 /// What a command palette entry does.
@@ -1001,6 +1016,7 @@ enum Command {
     CopyCode,
     Stop,
     Quit,
+    Rewind,
     Session(DocId),
 }
 
@@ -1053,6 +1069,12 @@ pub struct Chat {
     models_wanted: bool,
     /// Scrollbars under the pointer, by `Bar::id`.
     bars_hovered: [bool; 3],
+    /// The prompt picked to rewind to (index into the session's marks).
+    rewind_at: Option<usize>,
+    /// When esc was last pressed on an empty box (twice opens rewind).
+    last_esc: Option<std::time::Instant>,
+    /// The transcript changed in place (a rewind): fade it in as a whole.
+    refade: bool,
     /// Folded runs the user opened, per session (keyed by line index).
     unfolded: HashMap<DocId, std::collections::HashSet<usize>>,
     /// The session being renamed, and whether to go back to the session
@@ -1155,6 +1177,9 @@ impl Chat {
             confirm: None,
             models_wanted: false,
             bars_hovered: [false; 3],
+            rewind_at: None,
+            last_esc: None,
+            refade: false,
             unfolded: HashMap::new(),
             renaming: None,
             wheel_rest: 0.0,
@@ -1748,10 +1773,19 @@ impl Chat {
                     String::new()
                 };
                 let turns = if info.turns == 1 { "turn" } else { "turns" };
+                // Work left in its own worktree: the branch to merge.
+                let branch = info
+                    .worktree
+                    .as_ref()
+                    .map_or_else(String::new, |tree| format!(" · ⎇ {}", tree.branch));
                 let row = Segment::Agent {
                     id: info.id.clone(),
                     title: agent_title(&info),
-                    status: format!("{} · {} {turns}{price}", info.status.label(), info.turns),
+                    status: format!(
+                        "{} · {} {turns}{price}{branch}",
+                        info.status.label(),
+                        info.turns
+                    ),
                     activity: String::new(),
                     calls: Vec::new(),
                 };
@@ -2380,6 +2414,17 @@ impl Chat {
         };
         match self.pick {
             Pick::Rename => {}
+            Pick::Rewind => {
+                self.open_rewind_how(id as usize);
+                return Outcome::Redraw;
+            }
+            Pick::RewindHow => {
+                self.mode = Mode::Chat;
+                if let Some(at) = self.rewind_at.take() {
+                    self.rewind(at, id == 0 || id == 2, id == 0 || id == 1);
+                }
+                return Outcome::Redraw;
+            }
             Pick::Commands => {
                 self.mode = Mode::Chat;
                 return match self.commands.get(id as usize).copied() {
@@ -2448,6 +2493,7 @@ impl Chat {
             ),
             (CompactionModels, "Choose compaction models…\tctrl+k".into()),
             (CopyCode, "Copy last code block\tctrl+y".into()),
+            (Rewind, "Rewind to an earlier prompt…\tesc esc".into()),
             (RenameSession, "Rename this session…\tf2".into()),
             (DeleteSession, "Delete this session…\tctrl+w".into()),
             (Quit, "Quit\tctrl+q".into()),
@@ -2503,12 +2549,177 @@ impl Chat {
                 }
             }
             Command::Quit => return Outcome::Quit,
+            Command::Rewind => self.open_rewind(),
             Command::Session(id) => {
                 self.dispatch(Action::Select(id));
                 self.scroll = 0;
             }
         }
         Outcome::Redraw
+    }
+
+    /// Where session `doc`'s rewind marks and file snapshots are kept.
+    fn checkpoints(&self, doc: DocId) -> PathBuf {
+        self.data_dir.join("checkpoints").join(doc.to_string())
+    }
+
+    /// The session's prompts, newest first, each with how many files its
+    /// turn changed and when: the list to rewind from.
+    fn open_rewind(&mut self) {
+        let Some(doc) = self.client.app().selected().map(|doc| doc.id) else {
+            return;
+        };
+        let marks = git::marks(&self.checkpoints(doc));
+        if marks.is_empty() {
+            self.notice =
+                Some("nothing to rewind yet · rewind goes back to before a prompt".into());
+            return;
+        }
+        let now = std::time::SystemTime::now();
+        let items = marks
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, mark)| {
+                let prompt = match mark.prompt.lines().next().unwrap_or_default().trim() {
+                    "" => "(continue)".to_string(),
+                    line => line.chars().take(70).collect(),
+                };
+                let files = match (&mark.changed, &mark.before) {
+                    (Some(changed), _) if changed.is_empty() => "no files".to_string(),
+                    (Some(changed), _) if changed.len() == 1 => "1 file".to_string(),
+                    (Some(changed), _) => format!("{} files", changed.len()),
+                    (None, Some(_)) => "files ?".to_string(),
+                    (None, None) => String::new(),
+                };
+                let when = ago(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(mark.at),
+                    now,
+                );
+                Item {
+                    id: index as u64,
+                    label: format!("{prompt}\t{files}  {when}"),
+                }
+            })
+            .collect();
+        self.picker.set_items(items);
+        self.picker.clear();
+        self.pick = Pick::Rewind;
+        self.mode = Mode::Picker;
+    }
+
+    /// What to restore, going back to before prompt `at` (Claude Code's
+    /// choices). The code ones only when those turns changed files.
+    fn open_rewind_how(&mut self, at: usize) {
+        let Some(doc) = self.client.app().selected().map(|doc| doc.id) else {
+            return;
+        };
+        let marks = git::marks(&self.checkpoints(doc));
+        let Some(mark) = marks.get(at) else {
+            self.mode = Mode::Chat;
+            return;
+        };
+        let files: Option<usize> = mark.before.as_ref().map(|_| {
+            marks[at..]
+                .iter()
+                .map(|mark| mark.changed.as_ref().map_or(1, Vec::len))
+                .sum()
+        });
+        let mut items = Vec::new();
+        if files.is_some_and(|n| n > 0) {
+            items.push((0, "Restore code and conversation"));
+        }
+        items.push((1, "Restore conversation"));
+        if files.is_some_and(|n| n > 0) {
+            items.push((2, "Restore code"));
+        }
+        items.push((3, "Never mind"));
+        self.picker.set_items(
+            items
+                .into_iter()
+                .map(|(id, label)| Item {
+                    id,
+                    label: label.to_string(),
+                })
+                .collect(),
+        );
+        self.picker.clear();
+        self.rewind_at = Some(at);
+        self.pick = Pick::RewindHow;
+        self.mode = Mode::Picker;
+    }
+
+    /// Go back to before prompt `at`: the files its turns (and later ones)
+    /// changed, and/or the chat. Files nobody touched in those turns stay as
+    /// they are (the user's own edits survive). The chat's prompt comes back
+    /// into the box to edit and send again.
+    fn rewind(&mut self, at: usize, code: bool, chat: bool) {
+        let Some(doc) = self.client.app().selected().map(|doc| doc.id) else {
+            return;
+        };
+        if self.clock.generating() {
+            self.notice = Some("still answering · stop it first (esc)".into());
+            return;
+        }
+        let writing = self.agents.get(&doc).is_some_and(|list| {
+            list.iter()
+                .any(|info| info.status == Status::Running && info.write && info.worktree.is_none())
+        });
+        if writing && code {
+            self.notice =
+                Some("a subagent is changing files · wait for it or stop it first".into());
+            return;
+        }
+        let dir = self.checkpoints(doc);
+        let mut marks = git::marks(&dir);
+        let Some(mark) = marks.get(at).cloned() else {
+            return;
+        };
+        let mut done = Vec::new();
+        if code {
+            match git::rewind(&dir, &self.cwd(), &marks, at) {
+                Ok(0) => done.push("no files to restore".to_string()),
+                Ok(1) => done.push("1 file restored".to_string()),
+                Ok(n) => done.push(format!("{n} files restored")),
+                Err(why) => {
+                    self.notice = Some(format!("can't restore the files: {why}"));
+                    return;
+                }
+            }
+        }
+        if chat {
+            self.dispatch(Action::Truncate(mark.body));
+            // The exact conversation up to that prompt when it still lines
+            // up (compaction may have folded it), else rebuilt from the text.
+            let messages = self
+                .conversations
+                .get(&doc)
+                .cloned()
+                .or_else(|| self.load_conversation(doc))
+                .filter(|messages| {
+                    messages.get(mark.messages).is_some_and(|next| {
+                        next.role == smash_ai::Role::User
+                            && next.text().trim_start().starts_with(mark.prompt.trim())
+                    })
+                })
+                .map(|mut messages| {
+                    messages.truncate(mark.messages);
+                    messages
+                })
+                .unwrap_or_else(|| history(&self.client.view().transcript));
+            self.save_conversation(doc, &messages);
+            self.conversations.insert(doc, messages);
+            self.failed = None;
+            self.context.remove(&doc);
+            marks.truncate(at);
+            git::save_marks(&dir, &marks);
+            self.editor = Editor::default();
+            self.editor.insert(&mark.prompt);
+            self.scroll = 0;
+            self.refade = true;
+            done.push("chat back to before that prompt".to_string());
+        }
+        self.notice = Some(format!("✓ {}", done.join(" · ")));
     }
 
     /// Delete a session for good: its transcript, saved conversation and
@@ -2526,6 +2737,7 @@ impl Chat {
         // ponytail: subagents still running keep going and may save once
         // more; stop them through the worker if that ever matters.
         let _ = std::fs::remove_dir_all(self.data_dir.join("agents").join(id.to_string()));
+        let _ = std::fs::remove_dir_all(self.checkpoints(id));
         self.dispatch(Action::Close(id));
         if self.client.app().selected().is_none() {
             self.dispatch(Action::New);
@@ -2659,7 +2871,7 @@ impl Chat {
                 Command::Session(doc) => Some(*doc),
                 _ => None,
             },
-            Pick::Models | Pick::Rename => None,
+            Pick::Models | Pick::Rename | Pick::Rewind | Pick::RewindHow => None,
         }
     }
 
@@ -2737,6 +2949,17 @@ impl Chat {
             Key::Esc if self.cancel.is_some() && editor.is_empty() => {
                 if let Some(cancel) = &self.cancel {
                     cancel.cancel();
+                }
+            }
+            // Twice on an empty box: rewind (as in Claude Code).
+            Key::Esc if editor.is_empty() && self.attached.is_empty() => {
+                let now = std::time::Instant::now();
+                let twice = self.last_esc.is_some_and(|then| {
+                    now.duration_since(then) < std::time::Duration::from_millis(600)
+                });
+                self.last_esc = if twice { None } else { Some(now) };
+                if twice {
+                    self.open_rewind();
                 }
             }
             Key::Esc => editor.escape(),
@@ -2818,6 +3041,8 @@ impl Chat {
         for image in &images {
             turn.push_str(&image_line(image));
         }
+        let body = self.client.app().selected().map_or(0, |doc| doc.body.len());
+        let mark = git::Mark::new(if resume { "" } else { &prompt }, body, messages.len());
         messages.push(smash_ai::image::user_message(&prompt, images));
         self.dispatch(Action::Append(turn));
         // An unnamed session takes its first prompt as its name.
@@ -2845,6 +3070,7 @@ impl Chat {
             summarizers: self.summarizers(model),
             inbox: inbox.clone(),
             catalog: self.catalog.clone(),
+            checkpoint: (self.checkpoints(doc), mark),
         };
         if self.worker.jobs.send(job).is_err() {
             self.notice = Some("agent thread stopped · restart the app".into());
@@ -3222,6 +3448,8 @@ impl Chat {
                 Pick::Models => "models",
                 Pick::Commands => "commands",
                 Pick::Rename => "rename",
+                Pick::Rewind => "rewind to before",
+                Pick::RewindHow => "rewind",
             };
             let title = format!("{what} {}", self.picker.counter());
             let mut popup = popup::picker(
@@ -3268,9 +3496,11 @@ impl Chat {
     fn animate_transcript(&mut self, doc: Option<DocId>, width: usize, total: usize) -> f64 {
         let now = Seen { doc, width, total };
         let before = self.seen.replace(now);
+        let refade = std::mem::take(&mut self.refade);
         match before {
-            // Another session or width: a different picture, fade it in.
-            Some(before) if before.doc != doc || before.width != width => {
+            // Another session or width, or a rewound chat: a different
+            // picture, fade it in.
+            Some(before) if before.doc != doc || before.width != width || refade => {
                 self.motions.forget_rows();
                 self.motions.start(Anim::Content, 0.0, 1.0, Spring::FADE);
                 self.motions.snap(Anim::Scroll, self.scroll as f64);
@@ -3447,6 +3677,9 @@ impl Chat {
             }
             if picker && self.pick == Pick::Sessions && self.confirm.is_none() {
                 items.extend(["enter open", "f2 rename", "del delete", "ctrl+n new"]);
+            }
+            if picker && self.pick == Pick::Rewind {
+                items.extend(["enter choose", "esc cancel"]);
             }
             if self.mode == Mode::Picker && self.pick == Pick::Models {
                 items.push("ctrl+k compaction model ⟲");
@@ -3892,6 +4125,8 @@ mod motion_tests {
             cost: 0.0,
             model: "m".into(),
             write: false,
+            worktree: None,
+            isolated: false,
         }
     }
 
@@ -4212,6 +4447,87 @@ mod motion_tests {
             before[..ROWS - 3],
             "reading position unchanged"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rewinding_the_chat_fades_it_back_in_with_the_prompt_in_the_box() {
+        use smash_ai::Message;
+        let (mut chat, dir) = chat();
+        let doc = chat.client.app().selected().unwrap().id;
+        // Two prompts; the second is where we go back to.
+        chat.dispatch(Action::Append(format!(
+            "{}first answer\n\n",
+            crate::user_turn("one")
+        )));
+        let body = chat.client.app().selected().unwrap().body.len();
+        chat.dispatch(Action::Append(format!(
+            "{}second answer\n\n",
+            crate::user_turn("two")
+        )));
+        let marks = chat.checkpoints(doc);
+        smash_backend::git::save_marks(
+            &marks,
+            &[
+                smash_backend::git::Mark::new("one", 0, 0),
+                smash_backend::git::Mark::new("two", body, 2),
+            ],
+        );
+        let exact = vec![
+            Message::user("one"),
+            Message::assistant(vec![smash_ai::Content::Text {
+                text: "first answer".into(),
+            }]),
+            Message::user("two"),
+            Message::assistant(vec![smash_ai::Content::Text {
+                text: "second answer".into(),
+            }]),
+        ];
+        chat.save_conversation(doc, &exact);
+        let mut t = Instant::now();
+        chat.frame_at(COLS, ROWS, t);
+        settle(&mut chat, &mut t, 60);
+
+        // esc esc opens the prompts, newest first; then what to restore.
+        chat.key(Key::Esc, Mods::default());
+        chat.key(Key::Esc, Mods::default());
+        assert_eq!(chat.pick, super::Pick::Rewind);
+        assert!(chat.picker.matches()[0].label.starts_with("two"));
+        chat.key(Key::Enter, Mods::default());
+        assert_eq!(chat.pick, super::Pick::RewindHow);
+        let labels: Vec<String> = chat
+            .picker
+            .matches()
+            .iter()
+            .map(|item| item.label.clone())
+            .collect();
+        assert_eq!(
+            labels,
+            ["Restore conversation", "Never mind"],
+            "no snapshot, no code options"
+        );
+        chat.key(Key::Enter, Mods::default());
+
+        assert_eq!(chat.editor.text(), "two", "the prompt is back in the box");
+        let body = chat.client.app().selected().unwrap().body.clone();
+        assert!(
+            body.contains("first answer") && !body.contains("second answer"),
+            "{body}"
+        );
+        assert_eq!(chat.load_conversation(doc).unwrap(), exact[..2].to_vec());
+        assert_eq!(
+            smash_backend::git::marks(&marks).len(),
+            1,
+            "later marks dropped"
+        );
+        // The chat fades back in from the background, then settles.
+        t += FRAME;
+        let first = chat.frame_at(COLS, ROWS, t);
+        let row = row_with(&first, "first answer").expect("shown");
+        assert_eq!(row[0].paint.fg, NIGHT.bg, "fades in from the background");
+        let frames = settle(&mut chat, &mut t, 60);
+        let last = row_with(frames.last().unwrap(), "first answer").unwrap();
+        assert_ne!(last[0].paint.fg, NIGHT.bg);
         let _ = std::fs::remove_dir_all(dir);
     }
 

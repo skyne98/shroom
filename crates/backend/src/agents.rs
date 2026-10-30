@@ -33,13 +33,15 @@ const REPORT: usize = 8_000;
 
 /// For the parent's system prompt.
 pub const DOCS: &str = "Subagents (each one a separate model run with a fresh context that sees only its task):
-agents.spawn(task, {title, write?, model?}) -> id  start one in the background; it outlives this program.
+agents.spawn(task, {title, write?, isolation?, model?}) -> id  start one in the background; it outlives this program.
   title: 2-6 words the user sees, like 'Map the crates'; task: the full instructions
+  isolation: 'worktree' gives it its own git worktree (branch smash/<session>-<id>, made from the last commit; uncommitted changes are not in it).
+  It may change files there while others do too. Removed when it changed nothing; otherwise wait() reports {worktree, branch}: review, then git merge <branch>.
 agents.send(id, message) -> status              steer it between its turns; wakes a finished one, which keeps its history
 agents.wait(id | [ids], {timeout?}) -> {id, status, report, turns, cost}  until it finishes; timeout ms (default 300000)
 agents.list() -> [{id, task, status, turns}]    this session's subagents, including ones from earlier turns
 agents.stop(id)
-They are read-only unless {write: true} (one writer at a time), at most 4 run at once, and cannot spawn their own.
+They are read-only unless {write: true} (one writer in this checkout at a time; isolated ones don't count), at most 4 run at once, and cannot spawn their own.
 Delegate work whose raw output you don't need: searching, reading logs, mapping code, fresh-eyes review of a diff.
 Give the full task: they know nothing of this conversation. Implementation that depends on this conversation you do yourself.
 Spawn several, do other work, then wait; keep using an earlier agent with send instead of re-explaining to a new one.";
@@ -47,6 +49,8 @@ Spawn several, do other work, then wait; keep using an earlier agent with send i
 const CHILD: &str = "\n\nYou are a subagent. Another agent gave you the task in the first message and sees only your final message, never your tool output. Work until the task is done, then end with a concise report: findings with file:line, exact commands and errors that matter, what you changed, open questions. Later messages from the other agent may refine the task; answer each with an updated report.";
 const READ_ONLY: &str = "\nYou are read-only: write and edit refuse. Do not change files through sh either; report what to change.";
 const WRITER: &str = "\nYou may change files. You are the only agent changing files right now.";
+/// For an agent in its own worktree; `{path}` and `{branch}` filled in.
+const ISOLATED: &str = "\nYou work in your own git worktree at {path}, on branch {branch}: a separate checkout made from the last commit. Change files only inside it. Before your final report, commit your work there (git add -A && git commit -m '...'); the other agent merges your branch.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -84,6 +88,13 @@ pub struct Info {
     pub cost: f64,
     pub model: String,
     pub write: bool,
+    /// Its own checkout (`isolation: 'worktree'`); None once removed
+    /// because it held no work.
+    #[serde(default)]
+    pub worktree: Option<crate::git::Worktree>,
+    /// Asked for isolation (its worktree comes back when it is woken).
+    #[serde(default)]
+    pub isolated: bool,
 }
 
 /// Saved form: the info plus the full conversation.
@@ -267,15 +278,19 @@ impl Agents {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         self: &Arc<Self>,
         scope: &str,
         task: &str,
         title: Option<&str>,
         write: bool,
+        isolated: bool,
         model: Option<&str>,
         spec: &Spec,
     ) -> Result<Info, String> {
+        // An isolated agent changes files in its own checkout.
+        let write = write || isolated;
         if task.trim().is_empty() {
             return Err(
                 "spawn needs a task: agents.spawn('what to do, with all context it needs')".into(),
@@ -305,7 +320,12 @@ impl Agents {
                         .join(", ")
                 ));
             }
-            if write && let Some(writer) = running.iter().find(|info| info.write) {
+            if write
+                && !isolated
+                && let Some(writer) = running
+                    .iter()
+                    .find(|info| info.write && info.worktree.is_none())
+            {
                 return Err(format!(
                     "{} is already changing files; one writer at a time (wait for it, or spawn read-only)",
                     writer.id
@@ -317,10 +337,17 @@ impl Agents {
                 .max()
                 .unwrap_or(0)
                 + 1;
+            let id = format!("a{next}");
+            let worktree = if isolated {
+                Some(crate::git::worktree(&spec.cwd, &format!("{scope}-{id}"))?)
+            } else {
+                None
+            };
+            let first = first_message(task, write, worktree.as_ref());
             let child = Arc::new(Child {
                 state: Mutex::new(State {
                     info: Info {
-                        id: format!("a{next}"),
+                        id,
                         title: title
                             .map(str::trim)
                             .filter(|title| !title.is_empty())
@@ -335,8 +362,10 @@ impl Agents {
                         cost: 0.0,
                         model,
                         write,
+                        worktree,
+                        isolated,
                     },
-                    messages: vec![Message::user(first_message(task, write))],
+                    messages: vec![Message::user(first)],
                     cancel: CancellationToken::new(),
                 }),
                 inbox: Inbox::default(),
@@ -448,11 +477,34 @@ impl Agents {
                 ),
                 Err(_) => return,
             };
+            // Woken after its empty worktree was removed: a fresh one.
+            let worktree = match (&info.worktree, info.isolated) {
+                (Some(tree), _) => Some(tree.clone()),
+                (None, true) => {
+                    match crate::git::worktree(&spec.cwd, &format!("{scope}-{}", info.id)) {
+                        Ok(tree) => {
+                            if let Ok(mut state) = child.state.lock() {
+                                state.info.worktree = Some(tree.clone());
+                            }
+                            Some(tree)
+                        }
+                        Err(why) => {
+                            self.finish(&scope, &child, messages, Status::Failed, why, 0, 0.0);
+                            return;
+                        }
+                    }
+                }
+                (None, false) => None,
+            };
             let agent = match (spec.resolve)(&info.model) {
                 Some((model, window)) => {
                     let mut agent = Agent::new(model)
                         .effort(spec.effort)
-                        .cwd(spec.cwd.clone())
+                        .cwd(
+                            worktree
+                                .as_ref()
+                                .map_or_else(|| spec.cwd.clone(), |tree| tree.path.clone()),
+                        )
                         .context(
                             info.model.clone(),
                             window,
@@ -467,6 +519,7 @@ impl Agents {
                     agent.system = child_system();
                     agent.cache_key = Some(format!("smash-{scope}-agents"));
                     agent.read_only = !info.write;
+                    agent.confine = worktree.is_some();
                     agent.max_turns = CHILD_TURNS;
                     agent
                 }
@@ -535,12 +588,19 @@ impl Agents {
         turns: usize,
         cost: f64,
     ) {
+        // Done with its worktree: gone if it holds no work, kept for the
+        // parent to merge otherwise.
+        let kept = child
+            .info()
+            .worktree
+            .filter(|tree| !matches!(crate::git::remove_if_clean(tree), Ok(true)));
         if let Ok(mut state) = child.state.lock() {
             state.messages = messages;
             state.info.status = status;
             state.info.report = report;
             state.info.turns += turns;
             state.info.cost += cost;
+            state.info.worktree = kept;
         }
         if status == Status::Stopped {
             drain(&child.inbox);
@@ -576,8 +636,14 @@ pub fn child_system() -> String {
 }
 
 /// A subagent's first message: its mode, then the task.
-fn first_message(task: &str, write: bool) -> String {
-    let mode = if write { WRITER } else { READ_ONLY };
+fn first_message(task: &str, write: bool, worktree: Option<&crate::git::Worktree>) -> String {
+    let mode = match worktree {
+        Some(tree) => ISOLATED
+            .replace("{path}", &tree.path.display().to_string())
+            .replace("{branch}", &tree.branch),
+        None if write => WRITER.to_string(),
+        None => READ_ONLY.to_string(),
+    };
     format!("{}\n\nTask:\n{task}", mode.trim())
 }
 
@@ -595,7 +661,7 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 fn public(info: &Info) -> Value {
-    json!({
+    let mut value = json!({
         "id": info.id,
         "task": info.task,
         "status": info.status.label(),
@@ -603,7 +669,12 @@ fn public(info: &Info) -> Value {
         "turns": info.turns,
         "cost": (info.cost * 10_000.0).round() / 10_000.0,
         "write": info.write,
-    })
+    });
+    if let Some(tree) = &info.worktree {
+        value["worktree"] = json!(tree.path);
+        value["branch"] = json!(tree.branch);
+    }
+    value
 }
 
 /// The functions of one parent run.
@@ -668,15 +739,29 @@ impl smash_js::Host for Tools {
                         _ => text(0),
                     };
                     let write = opts["write"].as_bool().unwrap_or(false);
+                    let isolated = match opts["isolation"].as_str() {
+                        None | Some("none") => false,
+                        Some("worktree") => true,
+                        Some(other) => {
+                            return Err(format!(
+                                "isolation {other:?}: use 'worktree' (or leave it out)"
+                            ));
+                        }
+                    };
                     let info = agents.spawn(
                         scope,
                         &task,
                         opts["title"].as_str(),
                         write,
+                        isolated,
                         opts["model"].as_str(),
                         &self.spec,
                     )?;
-                    let mode = if write { " · writes" } else { "" };
+                    let mode = match &info.worktree {
+                        Some(tree) => format!(" · worktree {}", tree.branch),
+                        None if info.write => " · writes".to_string(),
+                        None => String::new(),
+                    };
                     Ok((Value::String(info.id.clone()), format!("{}{mode}", info.id)))
                 }
                 "agents.send" => {

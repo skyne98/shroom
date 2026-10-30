@@ -138,6 +138,8 @@ pub struct Agent {
     pub host: Option<Arc<dyn smash_js::Host>>,
     /// `write`/`edit` refuse.
     pub read_only: bool,
+    /// `write`/`edit` refuse paths outside `cwd` (its own worktree).
+    pub confine: bool,
     /// Groups this conversation's requests on one provider cache (one per
     /// session; its subagents share it, their prefix is the same).
     pub cache_key: Option<String>,
@@ -212,6 +214,7 @@ impl Agent {
             max_turns: MAX_TURNS,
             host: None,
             read_only: false,
+            confine: false,
             cache_key: None,
             images: std::env::temp_dir().join("smash-images"),
         }
@@ -650,6 +653,7 @@ impl Agent {
         };
         let limits = smash_js::Limits {
             read_only: self.read_only,
+            confine: self.confine,
             ..smash_js::Limits::default()
         };
         let run = smash_js::run_with(&code, &self.cwd, limits, log, self.host.clone());

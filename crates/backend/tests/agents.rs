@@ -160,13 +160,13 @@ async fn spawn_wait_steer_and_resume_after_restart() {
     assert!(err.contains("a9") && err.contains("a1"), "{err}");
     assert!(
         agents
-            .spawn("s1", " ", None, false, None, &spec)
+            .spawn("s1", " ", None, false, false, None, &spec)
             .unwrap_err()
             .contains("needs a task")
     );
     assert!(
         agents
-            .spawn("s1", "t", None, false, Some("nope/nope"), &spec)
+            .spawn("s1", "t", None, false, false, Some("nope/nope"), &spec)
             .unwrap_err()
             .contains("unknown model")
     );
@@ -189,22 +189,26 @@ async fn running_limits_one_writer_and_stop() {
     let spec = spec(&url, &dir);
 
     let writer = agents
-        .spawn("s", "change a file", None, true, None, &spec)
+        .spawn("s", "change a file", None, true, false, None, &spec)
         .unwrap();
     assert!(writer.write);
     let err = agents
-        .spawn("s", "change another", None, true, None, &spec)
+        .spawn("s", "change another", None, true, false, None, &spec)
         .unwrap_err();
     assert!(err.contains("one writer"), "{err}");
     for task in ["r1", "r2", "r3"] {
-        agents.spawn("s", task, None, false, None, &spec).unwrap();
+        agents
+            .spawn("s", task, None, false, false, None, &spec)
+            .unwrap();
     }
     let err = agents
-        .spawn("s", "r4", None, false, None, &spec)
+        .spawn("s", "r4", None, false, false, None, &spec)
         .unwrap_err();
     assert!(err.contains("already running"), "{err}");
     assert!(
-        agents.spawn("other", "r", None, false, None, &spec).is_ok(),
+        agents
+            .spawn("other", "r", None, false, false, None, &spec)
+            .is_ok(),
         "limits are per session"
     );
 
@@ -226,7 +230,9 @@ async fn running_limits_one_writer_and_stop() {
         assert_eq!(info.status, Status::Stopped, "{id}");
     }
     assert!(
-        agents.spawn("s", "after", None, true, None, &spec).is_ok(),
+        agents
+            .spawn("s", "after", None, true, false, None, &spec)
+            .is_ok(),
         "slots free again"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -240,4 +246,102 @@ fn every_subagent_shares_one_system_prompt() {
         !system.contains("read-only") && !system.contains("only agent changing"),
         "mode lives in the first message, not the shared prefix"
     );
+}
+
+/// An isolated child changes files in its own worktree; the main checkout
+/// never sees them. A child that changed nothing leaves no worktree behind.
+fn worktree_script(body: &str) -> String {
+    if body.contains("COMMITTED") {
+        common::text("committed my change")
+    } else if body.contains("make a change") {
+        common::js(
+            "// change\nawait write('new.txt', 'hi');\nlet out; try { await write('../../../escape.txt', 'x') } catch (e) { out = 'refused' }\nawait sh(\"git add -A && git -c user.email=t@t -c user.name=t commit -qm agent\");\nreturn 'COMMITTED ' + out",
+        )
+    } else {
+        common::text("nothing to change")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn isolated_agents_work_in_their_own_worktree() {
+    let url = common::serve(Arc::new(worktree_script)).await;
+    let repo = temp("worktree");
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "init",
+        "--allow-empty",
+    ]);
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "a",
+    ]);
+    let agents = Arc::new(Agents::new(None, None));
+    let spec = spec(&url, &repo);
+
+    // Two isolated writers at once: they don't count as the one writer.
+    let busy = agents
+        .spawn("s", "make a change", None, false, true, None, &spec)
+        .unwrap();
+    let idle = agents
+        .spawn("s", "look around", None, false, true, None, &spec)
+        .unwrap();
+    assert!(busy.write && busy.worktree.is_some());
+    let busy = agents
+        .wait("s", &busy.id, Duration::from_secs(20))
+        .await
+        .unwrap();
+    let idle = agents
+        .wait("s", &idle.id, Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert_eq!(busy.status, Status::Idle, "{}", busy.report);
+
+    let tree = busy.worktree.expect("work keeps its worktree");
+    assert_eq!(tree.branch, "smash/s-a1");
+    assert!(tree.path.join("new.txt").exists());
+    assert!(
+        !repo.join("new.txt").exists(),
+        "the main checkout never sees it"
+    );
+    assert!(
+        !repo.join("escape.txt").exists(),
+        "writes outside are refused"
+    );
+    assert!(idle.worktree.is_none(), "an empty worktree is removed");
+    assert!(!repo.join(".smash/worktrees/s-a2").exists());
+    // The parent merges the branch like any other.
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "merge",
+        "-q",
+        "smash/s-a1",
+    ]);
+    assert!(repo.join("new.txt").exists());
+    let _ = std::fs::remove_dir_all(&repo);
 }

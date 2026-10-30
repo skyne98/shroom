@@ -25,6 +25,9 @@ pub enum Action {
     Rename(String),
     /// Appends text to the selected document's body (chat transcript).
     Append(String),
+    /// Cuts the selected document's body back to its first `len` bytes
+    /// (rewinding the chat to before a prompt).
+    Truncate(usize),
     Close(DocId),
     Quit,
 }
@@ -171,6 +174,19 @@ impl App {
                 let saved = doc.clone();
                 vec![Effect::Save(saved)]
             }
+            Action::Truncate(len) => {
+                let Some(id) = self.selected else {
+                    return Vec::new();
+                };
+                let Some(doc) = self.docs.iter_mut().find(|doc| doc.id == id) else {
+                    return Vec::new();
+                };
+                if len >= doc.body.len() || !doc.body.is_char_boundary(len) {
+                    return Vec::new();
+                }
+                doc.body.truncate(len);
+                vec![Effect::Save(doc.clone())]
+            }
             Action::Close(id) => {
                 self.docs.retain(|d| d.id != id);
                 if self.selected == Some(id) {
@@ -261,6 +277,13 @@ mod tests {
 
         app.dispatch(Action::Append("hello\nworld\n".into()));
         assert_eq!(app.view().transcript, vec!["hello", "world"]);
+        assert!(
+            matches!(app.dispatch(Action::Truncate(6)).as_slice(), [Effect::Save(d)] if d.body == "hello\n")
+        );
+        assert!(
+            app.dispatch(Action::Truncate(99)).is_empty(),
+            "nothing to cut"
+        );
 
         app.dispatch(Action::Close(8));
         assert_eq!(app.view().rows.len(), 1);
