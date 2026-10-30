@@ -59,10 +59,11 @@ rustPlatform.buildRustPackage {
     lockFile = ../Cargo.lock;
     # One per git repository in Cargo.lock.
     outputHashes = {
-      "collections-0.1.0" = "sha256-AhJOtZ3lACz3347iyv19gUYSG5+KabXQiVIG3snip64=";
+      "collections-0.1.0" = "sha256-k7PI2NGIagNke4jKt3LNd5y40XMnwSHZYA+wiAozrOk=";
       "xim-ctext-0.3.0" = "sha256-pRT4Sz1JU9ros47/7pmIW9kosWOGMOItcnNd+VrvnpE=";
       "zed-font-kit-0.14.1-zed" = "sha256-KXygi0olNQi5yM8eaJVykNDtbPMDjT+cWPBF8UrtXR4=";
       "zed-scap-0.0.8-zed" = "sha256-BihiQHlal/eRsktyf0GI3aSWsUCW7WcICMsC2Xvb7kw=";
+      "gpui-base-0.5.2" = "sha256-0AY0tuhP8Jc6JXDitmXPReOvzWVnim2KY1rll9Qs2xA=";
     };
   };
 
