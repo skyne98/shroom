@@ -736,12 +736,46 @@ fn summary_row(lines: &[Line], work: &[(usize, usize, Role)], width: usize, mark
         meta.push("thought".to_string());
     }
     let left = if titles.is_empty() {
-        format!("thought · {}", plural(words, "word", "words"))
+        if pixels() {
+            "Thought".to_string()
+        } else {
+            format!("thought · {}", plural(words, "word", "words"))
+        }
     } else {
         titles.join(", ")
     };
-    // The window draws the summary in the prose face; the terminal in cells.
-    let sans = |paint: Paint| if pixels() { paint.sans() } else { paint };
+    if pixels() && titles.is_empty() && words > 0 {
+        meta.push(plural(words, "word", "words"));
+        meta.retain(|part| part != "thought");
+    }
+    // The window (as Claude desktop): one quiet line, the stats after the
+    // titles and a chevron after both; no columns.
+    if pixels() {
+        let muted = Paint::fg(NIGHT.muted).sans();
+        let mut row = vec![run("  ", TEXT), run(left, muted)];
+        if !meta.is_empty() {
+            row.push(run(
+                format!(" · {}", meta.join(" · ")),
+                Paint::fg(NIGHT.faint).sans(),
+            ));
+        }
+        if failed > 0 {
+            row.push(run(
+                format!(" · {failed} failed"),
+                Paint::fg(NIGHT.error).sans(),
+            ));
+        }
+        row.push(run(
+            if mark.starts_with('▾') {
+                " ⌄"
+            } else {
+                " ›"
+            },
+            muted,
+        ));
+        return row;
+    }
+    let sans = |paint: Paint| paint;
     let mut right = vec![run(meta.join(" · "), sans(Paint::fg(NIGHT.muted)))];
     if failed > 0 {
         right.push(run(
@@ -777,6 +811,35 @@ fn thinking_rows(lines: &[Line], width: usize, show: bool, live: bool) -> Vec<Ro
         .iter()
         .map(|line| line.text.split_whitespace().count())
         .sum();
+    // The window (as DeepSeek): reasoning hangs off a faint bar on its left.
+    let bar = || vec![run("  ", TEXT), run("│ ", Paint::fg(NIGHT.faint))];
+    if pixels() {
+        let muted = Paint::fg(NIGHT.muted).sans();
+        let mut rows = Vec::new();
+        if !show {
+            let label = if live { "Thinking…" } else { "Thought" };
+            rows.push(vec![run("  ", TEXT), run(label, muted)]);
+        }
+        let mut body = Vec::new();
+        for line in lines {
+            body.extend(wrap(
+                bar(),
+                bar(),
+                vec![run(line.text.clone(), thought())],
+                width,
+                None,
+            ));
+        }
+        if !show {
+            if !live {
+                return rows;
+            }
+            let skip = body.len().saturating_sub(LIVE_THOUGHT);
+            body.drain(..skip);
+        }
+        rows.extend(body);
+        return rows;
+    }
     if !show {
         let label = if live { "thinking…" } else { "thought" };
         let mut rows = vec![vec![
@@ -847,11 +910,31 @@ fn program_rows(lines: &[Line], width: usize, live: bool) -> Vec<Row> {
             (_, Some(_)) => (format!("{summary} · failed"), error),
             _ => (summary, DIM),
         };
-        rows.push(spread(
-            vec![run("⏵ ", ACCENT), run(title, TEXT.bold())],
-            vec![run(right, paint)],
-            width,
-        ));
+        if pixels() {
+            // The window (as Claude desktop's steps): the title in the prose
+            // face, its stats right after it, quiet.
+            let mut row = vec![run("  ", TEXT), run(title, TEXT.sans())];
+            if !right.is_empty() {
+                row.push(run(
+                    format!(" · {right}"),
+                    Paint {
+                        face: Face::Sans,
+                        ..if paint == DIM {
+                            Paint::fg(NIGHT.muted)
+                        } else {
+                            paint
+                        }
+                    },
+                ));
+            }
+            rows.push(row);
+        } else {
+            rows.push(spread(
+                vec![run("⏵ ", ACCENT), run(title, TEXT.bold())],
+                vec![run(right, paint)],
+                width,
+            ));
+        }
         if let Some(failure) = failure {
             rows.push(vec![
                 run("  └ ", error),
@@ -917,6 +1000,32 @@ fn program_rows(lines: &[Line], width: usize, live: bool) -> Vec<Row> {
             run(target, TEXT),
         ];
         let info = clip(info, (width / 3).max(12));
+        let info_paint = match (running, ok) {
+            (true, _) => RUNNING,
+            (false, true) => DIM,
+            (false, false) => error,
+        };
+        if pixels() {
+            // A step: its mark and verb, the command muted, the result after.
+            let mut row = left;
+            if let Some(target) = row.last_mut() {
+                target.paint = Paint::fg(NIGHT.muted);
+                target.text = clip(
+                    &target.text,
+                    width.saturating_sub(VERB + 6 + info.width() + 3),
+                );
+            }
+            if !info.is_empty() {
+                let paint = if info_paint == DIM {
+                    Paint::fg(NIGHT.faint)
+                } else {
+                    info_paint
+                };
+                row.push(run(format!("  {info}"), paint.sans()));
+            }
+            rows.push(row);
+            continue;
+        }
         rows.push(spread(
             left,
             vec![run(

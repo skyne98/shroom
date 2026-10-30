@@ -4018,7 +4018,26 @@ impl Chat {
             }
         }
         let gap = usize::from(stored > 0 && !tail.rows.is_empty());
-        let total = stored + gap + tail.rows.len();
+        // The window (as zeron): the newest prompt sits at the top of the
+        // view with room below for its answer, which fills that room as it
+        // streams. Blank rows after the content make the room; they shrink
+        // as the answer grows, so nothing on screen moves.
+        let last_prompt = cache
+            .laid
+            .panels
+            .iter()
+            .filter(|(_, _, kind)| *kind == layout::Panel::Prompt)
+            .map(|(rows, ..)| rows.start)
+            .max();
+        let content_rows = stored + gap + tail.rows.len();
+        let room = match last_prompt {
+            Some(top) if self.pixels => {
+                // One row of air above the bubble.
+                viewport.saturating_sub(content_rows - top.saturating_sub(1))
+            }
+            _ => 0,
+        };
+        let total = content_rows + room;
         self.tail_rows = tail.rows.clone();
         self.viewport = viewport;
         self.max_scroll = total.saturating_sub(viewport);
@@ -4046,6 +4065,7 @@ impl Chat {
             .iter()
             .chain((0..gap).map(|_| &blank))
             .chain(tail.rows.iter())
+            .chain((0..room).map(|_| &blank))
             .collect();
         let whole_fade = self.motions.value(&Anim::Content).unwrap_or(1.0);
         let faded = |index: usize| {
@@ -4515,9 +4535,16 @@ impl Chat {
         let before = self.seen.replace(now);
         let refade = std::mem::take(&mut self.refade);
         match before {
-            // Another session or width, or a rewound chat: a different
-            // picture, fade it in.
-            Some(before) if before.doc != doc || before.width != width || refade => {
+            // A resize re-wraps the same text: it stays put, no flash (as in
+            // zeron). Row fades and the scroll motion would replay on the
+            // new row numbers, so they settle at once.
+            Some(before) if before.doc == doc && before.width != width && !refade => {
+                self.motions.forget_rows();
+                self.motions.snap(Anim::Scroll, self.scroll as f64);
+            }
+            // Another session or a rewound chat: a different picture, fade
+            // it in.
+            Some(before) if before.doc != doc || refade => {
                 self.motions.forget_rows();
                 self.motions.enter(Anim::Content, 0.0, 1.0, Ease::FADE_IN);
                 self.motions.snap(Anim::Scroll, self.scroll as f64);
@@ -4529,6 +4556,12 @@ impl Chat {
                     for row in before.total..total {
                         self.motions.enter(Anim::Row(row), 0.0, 1.0, Ease::FADE_IN);
                     }
+                }
+                // At the bottom, a sent prompt moves up to the top: glide
+                // there from where the content was (zeron), not a jump.
+                if self.scroll == 0 && self.pixels && total > before.total {
+                    self.motions
+                        .nudge(Anim::Scroll, (total - before.total) as f64);
                 }
                 if self.scroll > 0 {
                     let grown = total as isize - before.total as isize;
@@ -5760,6 +5793,49 @@ mod motion_tests {
         let frames = settle(&mut chat, &mut t, 60);
         let last = row_with(frames.last().unwrap(), "second session text").unwrap();
         assert_ne!(last[0].paint.fg, NIGHT.bg);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_sent_prompt_glides_to_the_top_with_room_for_its_answer() {
+        let (chat, dir) = chat();
+        let mut chat = chat.with_pixels();
+        let mut t = Instant::now();
+        chat.dispatch(Action::Append(format!(
+            "{}an earlier answer\n",
+            crate::user_turn("first")
+        )));
+        chat.frame_at(COLS, ROWS, t);
+        settle(&mut chat, &mut t, 60);
+        let at = |frame: &Frame| {
+            frame.rows[..frame.viewport]
+                .iter()
+                .position(|row| row.iter().any(|run| run.text.contains("second")))
+        };
+        chat.dispatch(Action::Append(crate::user_turn("second")));
+        t += FRAME;
+        let first = chat.frame_at(COLS, ROWS, t);
+        let start = at(&first);
+        let frames = settle(&mut chat, &mut t, 60);
+        let tops: Vec<usize> = frames.iter().filter_map(at).collect();
+        let end = *tops.last().expect("the prompt is shown");
+        assert_eq!(end, 1, "ends at the top, one row of air above it");
+        assert!(
+            start.is_none_or(|start| start > end),
+            "starts lower and glides up: {start:?} → {end}"
+        );
+        assert!(
+            tops.windows(2).all(|p| p[1] <= p[0]),
+            "never back down: {tops:?}"
+        );
+        // The glide lands well before the new rows finish fading in (500 ms).
+        let landed = tops.iter().position(|top| *top == end).unwrap_or(0);
+        assert!(landed * 16 <= 320, "lands after {} ms", landed * 16);
+        assert!(
+            frames.len() * 16 <= 520,
+            "settles in {} ms",
+            frames.len() * 16
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

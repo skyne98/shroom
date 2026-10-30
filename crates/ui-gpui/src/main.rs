@@ -1593,7 +1593,8 @@ impl Render for Root {
         let room_px = (20. + 6. + PILL_BUTTON + 8. + PILL_PAD + 8.) * z;
         self.chat
             .set_input_room((chip_cells + room_px / f32::from(m.cell)).ceil() as usize + 1);
-        let rows = ((f32::from(viewport.height) - chrome_h - m.pad) / m.line).max(4.);
+        // The grid counts a rule and a status row the window doesn't draw.
+        let rows = ((f32::from(viewport.height) - chrome_h - m.pad) / m.line + 2.).max(4.);
         let frame = self.chat.frame(columns as usize, rows as usize);
         self.shown = frame.rows[..frame.viewport.min(frame.rows.len())].to_vec();
         let chrome = frame.chrome.clone();
@@ -1998,6 +1999,8 @@ fn chat_body(
         bar.col = window_cols.saturating_sub(1);
         bars_el.push(scrollbar(bar, m, cx));
     }
+    // Pixels left over by the whole-row grid go above the transcript, so
+    // the composer always sits on the window's bottom edge.
     div()
         .flex_1()
         .min_h(px(0.))
@@ -2006,6 +2009,7 @@ fn chat_body(
         .pt(px(m.pad / 2.))
         .flex()
         .flex_col()
+        .justify_end()
         .child(transcript)
         .child(div().flex().flex_col().children(dock_rows))
         .child(composer_card)
@@ -2184,9 +2188,36 @@ fn effort_panel(
         );
     let thumb = panel.thumb;
     let accent = color(NIGHT.accent);
+    let drag = cx.entity().downgrade();
     let rail = canvas(
         move |bounds, _, _| slider.set(Some(bounds)),
         move |bounds, (), window, _| {
+            // Window-wide listeners (as zeron's slider): a drag keeps going
+            // outside the rail, and the panel occluding the root doesn't
+            // swallow it.
+            let moved = drag.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                if phase == gpui::DispatchPhase::Bubble
+                    && event.pressed_button == Some(MouseButton::Left)
+                {
+                    let _ = moved.update(cx, |root, cx| {
+                        if root.sliding {
+                            root.slide_to(event.position.x, count);
+                            cx.notify();
+                        }
+                    });
+                }
+            });
+            let released = drag.clone();
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                if phase == gpui::DispatchPhase::Bubble {
+                    let _ = released.update(cx, |root, cx| {
+                        if std::mem::take(&mut root.sliding) {
+                            cx.notify();
+                        }
+                    });
+                }
+            });
             let width = f32::from(bounds.size.width);
             let inset = THUMB_W / 2. * z;
             let run = (width - 2. * inset).max(0.);
