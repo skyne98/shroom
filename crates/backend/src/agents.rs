@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use smash_ai::{Effort, Message, Model};
+use shroom_ai::{Effort, Message, Model};
 use tokio::sync::{mpsc::UnboundedSender, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -35,7 +35,7 @@ const REPORT: usize = 8_000;
 pub const DOCS: &str = "Subagents (each one a separate model run with a fresh context that sees only its task):
 agents.spawn(task, {title, write?, isolation?, model?}) -> id  start one in the background; it outlives this program.
   title: 2-6 words the user sees, like 'Map the crates'; task: the full instructions
-  isolation: 'worktree' gives it its own git worktree (branch smash/<session>-<id>, made from the last commit; uncommitted changes are not in it).
+  isolation: 'worktree' gives it its own git worktree (branch shroom/<session>-<id>, made from the last commit; uncommitted changes are not in it).
   It may change files there while others do too. Removed when it changed nothing; otherwise wait() reports {worktree, branch}: review, then git merge <branch>.
 agents.send(id, message) -> status              steer it between its turns; wakes a finished one, which keeps its history
 agents.wait(id | [ids], {timeout?}) -> {id, status, report, turns, cost}  until it finishes; timeout ms (default 300000)
@@ -180,7 +180,11 @@ impl Agents {
     }
 
     /// The `js` host for one parent run in session `scope`.
-    pub fn host(self: &Arc<Self>, scope: impl Into<String>, spec: Spec) -> Arc<dyn smash_js::Host> {
+    pub fn host(
+        self: &Arc<Self>,
+        scope: impl Into<String>,
+        spec: Spec,
+    ) -> Arc<dyn shroom_js::Host> {
         Arc::new(Tools {
             agents: self.clone(),
             scope: scope.into(),
@@ -517,7 +521,7 @@ impl Agents {
                     // later runs of the same one) share its cached prefix.
                     // What differs goes in the first message.
                     agent.system = child_system();
-                    agent.cache_key = Some(format!("smash-{scope}-agents"));
+                    agent.cache_key = Some(format!("shroom-{scope}-agents"));
                     agent.read_only = !info.write;
                     agent.confine = worktree.is_some();
                     agent.max_turns = CHILD_TURNS;
@@ -555,7 +559,7 @@ impl Agents {
             let _ = forward.await;
             let (status, report, turns, cost) = match result {
                 Ok(run) => (Status::Idle, run.message.text(), run.turns, run.cost.total),
-                Err(error) if error.kind == smash_ai::Kind::Cancelled => {
+                Err(error) if error.kind == shroom_ai::Kind::Cancelled => {
                     (Status::Stopped, "stopped".to_string(), 0, 0.0)
                 }
                 Err(error) => (Status::Failed, format!("error: {}", error.message), 0, 0.0),
@@ -632,7 +636,7 @@ fn default_title(task: &str) -> String {
 
 /// The system prompt every subagent shares, byte for byte.
 pub fn child_system() -> String {
-    format!("{}{CHILD}", SYSTEM.replace("{TOOLS}", smash_js::TOOLS))
+    format!("{}{CHILD}", SYSTEM.replace("{TOOLS}", shroom_js::TOOLS))
 }
 
 /// A subagent's first message: its mode, then the task.
@@ -684,7 +688,7 @@ struct Tools {
     spec: Spec,
 }
 
-impl smash_js::Host for Tools {
+impl shroom_js::Host for Tools {
     fn names(&self) -> &[&'static str] {
         &[
             "agents.spawn",
@@ -718,7 +722,7 @@ impl smash_js::Host for Tools {
         }
     }
 
-    fn call<'a>(&'a self, name: &'a str, args: Vec<Value>) -> smash_js::HostFuture<'a> {
+    fn call<'a>(&'a self, name: &'a str, args: Vec<Value>) -> shroom_js::HostFuture<'a> {
         Box::pin(async move {
             let text = |at: usize| {
                 args.get(at)

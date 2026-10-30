@@ -3,7 +3,7 @@
 # that a plain NixOS profile doesn't expose, and links libs that are not on the
 # loader path (wayland and vulkan are system-wide, the rest are not).
 #
-#   scripts/dev.sh cargo run -p smash-gpui
+#   scripts/dev.sh cargo run -p shroom-gpui
 #   scripts/dev.sh cargo test
 set -euo pipefail
 

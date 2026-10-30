@@ -10,12 +10,12 @@ use tokio::net::TcpListener;
 pub type Handler = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// Key variable every fake model reads.
-pub const KEY: &str = "SMASH_FAKE_KEY";
+pub const KEY: &str = "SHROOM_FAKE_KEY";
 
-pub fn model(url: &str) -> smash_ai::Model {
+pub fn model(url: &str) -> shroom_ai::Model {
     // SAFETY: tests only ever set this one variable, always to the same value.
     unsafe { std::env::set_var(KEY, "x") };
-    smash_ai::Model::compatible(url.to_string(), KEY, "fake")
+    shroom_ai::Model::compatible(url.to_string(), KEY, "fake")
 }
 
 fn chunk(delta: serde_json::Value, finish: serde_json::Value) -> serde_json::Value {

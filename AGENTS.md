@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Rules for anyone (human or model) changing smash.
+Rules for anyone (human or model) changing shroom.
 
 ## Motion: every state change animates
 
@@ -27,7 +27,7 @@ animation, identical in the terminal and the window. No visible value jumps.
   (`Frame::shift`/`above`) and the popup's `open` value.
 - **Idle is free:** when nothing moves, `Chat::animating()` is false and clients
   drop to the slow tick (`frame_interval`).
-- **Accessibility:** `SMASH_REDUCED_MOTION=1` or `NO_MOTION=1` snaps everything.
+- **Accessibility:** `SHROOM_REDUCED_MOTION=1` or `NO_MOTION=1` snaps everything.
   The end state must always be readable without motion.
 - **Tested:** a new animated state gets a test in `chat.rs` `motion_tests`,
   driven through `Chat::frame_at` on a fake clock. It must check that the first
@@ -43,7 +43,7 @@ in with their rows; real pictures follow the same fade and smooth scroll).
 
 ## Other rules
 
-- Keep `smash-core` pure: no I/O, no pixels.
+- Keep `shroom-core` pure: no I/O, no pixels.
 - A feature is one Action in core, its Effect handler in backend, and one arm
   per frontend.
 - Run `cargo test --workspace` (gpui: `scripts/dev.sh cargo test`) and

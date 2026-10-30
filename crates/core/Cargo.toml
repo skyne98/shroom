@@ -1,5 +1,5 @@
 [package]
-name = "smash-core"
+name = "shroom-core"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

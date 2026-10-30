@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use smash_core::{Action, Event};
+use shroom_core::{Action, Event};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -107,7 +107,7 @@ pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<Record>> {
 
 /// Every action and every event lands in the log; `view` is not recorded
 /// (a view is derivable state, and it changes every frame).
-impl smash_core::Hooks for Session {
+impl shroom_core::Hooks for Session {
     fn action(&mut self, action: Action) -> Option<Action> {
         // Hooks cannot fail: a full disk must not take the UI down with it.
         let _ = self.append(Body::Action(action.clone()));
@@ -134,7 +134,7 @@ mod tests {
         // Tests run in parallel: pid + millisecond alone can collide.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "smash-session-{}-{}-{}",
+            "shroom-session-{}-{}-{}",
             std::process::id(),
             now_ms(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -192,8 +192,8 @@ mod tests {
         let session = Session::create(dir.join("sessions")).unwrap();
         let path = session.path().to_path_buf();
 
-        let mut client = smash_client::Client::with_hooks(
-            smash_backend::Files::new(dir.join("data")),
+        let mut client = shroom_client::Client::with_hooks(
+            shroom_backend::Files::new(dir.join("data")),
             Box::new(session),
         );
         client.start();

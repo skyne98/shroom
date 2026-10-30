@@ -6,7 +6,7 @@
 //!   those paths back as they were before the chosen prompt. The user's own
 //!   repository, index and history are never touched.
 //! * **Worktrees.** A subagent spawned with `isolation: 'worktree'` works in
-//!   `<repo>/.smash/worktrees/<name>` on branch `smash/<name>`, made from
+//!   `<repo>/.shroom/worktrees/<name>` on branch `shroom/<name>`, made from
 //!   HEAD (Claude Code's layout). It is removed when the agent leaves no
 //!   changes and kept for review otherwise.
 
@@ -86,7 +86,7 @@ impl Shadow {
             // collect them. Subagent worktrees are not the user's files.
             git(&git_dir, &["config", "gc.auto", "0"], None).ok()?;
             std::fs::create_dir_all(git_dir.join("info")).ok()?;
-            std::fs::write(git_dir.join("info").join("exclude"), ".smash/\n").ok()?;
+            std::fs::write(git_dir.join("info").join("exclude"), ".shroom/\n").ok()?;
         }
         Some(Self { git_dir, work })
     }
@@ -313,9 +313,9 @@ pub fn worktree(cwd: &Path, name: &str) -> Result<Worktree, String> {
     let root = toplevel(cwd).map_err(|_| {
         "worktree isolation needs a git repository; spawn without isolation".to_string()
     })?;
-    let home = root.join(".smash");
+    let home = root.join(".shroom");
     let path = home.join("worktrees").join(name);
-    let branch = format!("smash/{name}");
+    let branch = format!("shroom/{name}");
     if path.join(".git").exists() {
         return Ok(Worktree { path, branch });
     }
@@ -412,7 +412,7 @@ mod tests {
     fn repo() -> PathBuf {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("smash-git-{}-{n}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("shroom-git-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.txt"), "one\n").unwrap();
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn outside_git_there_is_nothing_to_snapshot() {
-        let dir = std::env::temp_dir().join(format!("smash-nogit-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-nogit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(Shadow::open(&dir.join("marks"), Path::new("/")).is_none());
         assert!(begin_turn(&dir.join("marks"), Path::new("/"), Mark::new("p", 0, 0)).is_none());
@@ -500,17 +500,17 @@ mod tests {
     fn worktrees_are_removed_when_empty_and_kept_with_work() {
         let root = repo();
         let empty = worktree(&root, "1-a1").unwrap();
-        assert_eq!(empty.branch, "smash/1-a1");
+        assert_eq!(empty.branch, "shroom/1-a1");
         assert!(empty.path.join("src/a.txt").exists());
         assert!(
             git(&root, &["status", "--porcelain"], None)
                 .unwrap()
                 .is_empty(),
-            ".smash hides itself"
+            ".shroom hides itself"
         );
         assert!(remove_if_clean(&empty).unwrap());
         assert!(!empty.path.exists());
-        assert!(git(&root, &["rev-parse", "--verify", "-q", "smash/1-a1"], None).is_err());
+        assert!(git(&root, &["rev-parse", "--verify", "-q", "shroom/1-a1"], None).is_err());
 
         let busy = worktree(&root, "1-a2").unwrap();
         std::fs::write(busy.path.join("src/a.txt"), "agent\n").unwrap();

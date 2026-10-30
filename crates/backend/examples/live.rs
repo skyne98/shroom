@@ -1,9 +1,9 @@
 //! One live run against a real provider, printing thinking, text and tool calls.
 //!
-//!   DEEPSEEK_API_KEY=... cargo run -p smash-backend --example live -- "your question" [effort]
+//!   DEEPSEEK_API_KEY=... cargo run -p shroom-backend --example live -- "your question" [effort]
 
-use smash_ai::{Effort, Message, Model};
-use smash_backend::{Agent, Update};
+use shroom_ai::{Effort, Message, Model};
+use shroom_backend::{Agent, Update};
 use std::io::Write;
 
 #[tokio::main]

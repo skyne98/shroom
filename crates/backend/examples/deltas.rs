@@ -1,7 +1,7 @@
 //! Print the first streamed text deltas of N runs, delta boundaries marked │.
-//!   DEEPSEEK_API_KEY=... cargo run -q -p smash-backend --example deltas -- "question" 3
-use smash_ai::{Message, Model};
-use smash_backend::{Agent, Update};
+//!   DEEPSEEK_API_KEY=... cargo run -q -p shroom-backend --example deltas -- "question" 3
+use shroom_ai::{Message, Model};
+use shroom_backend::{Agent, Update};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

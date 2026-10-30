@@ -1,6 +1,6 @@
-//! gpui client: translates gpui key/scroll events into `smash_ui::chat::Key`
+//! gpui client: translates gpui key/scroll events into `shroom_ui::chat::Key`
 //! and paints the rows `Chat::frame` lays out, in a monospace grid. All
-//! behaviour lives in smash-ui, shared with the terminal client.
+//! behaviour lives in shroom-ui, shared with the terminal client.
 
 use std::ops::Range;
 use std::time::Duration;
@@ -13,10 +13,10 @@ use gpui::{
     WindowOptions, div, font, img, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
-use smash_ui::NIGHT;
-use smash_ui::chat::{Chat, Cursor, Key, Mods, Outcome};
-use smash_ui::layout::{self, Bar, Paint, Row};
-use smash_ui::popup::Popup;
+use shroom_ui::NIGHT;
+use shroom_ui::chat::{Chat, Cursor, Key, Mods, Outcome};
+use shroom_ui::layout::{self, Bar, Paint, Row};
+use shroom_ui::popup::Popup;
 
 const FONT: &str = "JetBrainsMono Nerd Font";
 /// Base metrics at zoom 1; everything scales with `Root::zoom`.
@@ -361,7 +361,7 @@ fn text_run(text: &str, paint: Paint) -> TextRun {
 
 /// One picture, placed on its cells inside the transcript box. A picture cut
 /// by the top edge keeps its full size and slides up under the clip.
-fn picture(shown: &smash_ui::chat::Shown, shift: Pixels, m: Metrics) -> impl IntoElement {
+fn picture(shown: &shroom_ui::chat::Shown, shift: Pixels, m: Metrics) -> impl IntoElement {
     let p = &shown.picture;
     let top = px((p.row as f32 - shown.skip as f32) * m.line) + shift;
     div()
@@ -397,8 +397,8 @@ fn scrollbar_at(
     let inset = px(2.);
     // 3 px collapsed, 6 px open; the track fades in with it.
     let width = 3. + 3. * open;
-    let track = smash_ui::motion::mix(NIGHT.bg, NIGHT.surface, f64::from(open));
-    let thumb = smash_ui::motion::mix(NIGHT.faint, NIGHT.dim, f64::from(open));
+    let track = shroom_ui::motion::mix(NIGHT.bg, NIGHT.surface, f64::from(open));
+    let thumb = shroom_ui::motion::mix(NIGHT.faint, NIGHT.dim, f64::from(open));
     let id = bar.id;
     div()
         .id(("scrollbar", id))
@@ -443,7 +443,7 @@ fn popup(view: Popup, m: Metrics, cx: &mut Context<Root>) -> impl IntoElement {
     let open = view.open.clamp(0.0, 1.0);
     // Border and title arrive with the rows; the box grows to its width with
     // the spring (overshoot included), so it visibly pops.
-    let border = smash_ui::motion::mix(NIGHT.bg, NIGHT.dim, open);
+    let border = shroom_ui::motion::mix(NIGHT.bg, NIGHT.dim, open);
     let grow = (0.92 + 0.08 * view.open) as f32;
     // Its rows start under the title line; its column is past the rows, so
     // shift the origin to center the 6 px bar in the right padding.
@@ -599,7 +599,7 @@ impl Render for Root {
 
 fn main() {
     if std::env::args().any(|arg| arg == "--version") {
-        println!("smash {}", env!("CARGO_PKG_VERSION"));
+        println!("shroom {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     application().run(|cx: &mut App| {
@@ -608,14 +608,14 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 // Matches the launcher entry (StartupWMClass) so docks and
-                // window lists show it as smash.
-                app_id: Some("smash".into()),
+                // window lists show it as shroom.
+                app_id: Some("shroom".into()),
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| Root::new(window, cx)),
         );
         if let Err(err) = opened {
-            eprintln!("smash: cannot open a window: {err}");
+            eprintln!("shroom: cannot open a window: {err}");
             cx.quit();
             return;
         }

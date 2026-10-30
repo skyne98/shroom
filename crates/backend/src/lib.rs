@@ -16,8 +16,8 @@ pub use tokio_util::sync::CancellationToken;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use smash_client::Backend;
-use smash_core::{Doc, DocId, Effect, Event};
+use shroom_client::Backend;
+use shroom_core::{Doc, DocId, Effect, Event};
 
 pub struct Files {
     dir: PathBuf,
@@ -28,13 +28,13 @@ impl Files {
         Self { dir: dir.into() }
     }
 
-    /// `$XDG_DATA_HOME/smash`, falling back to `~/.local/share/smash`.
+    /// `$XDG_DATA_HOME/shroom`, falling back to `~/.local/share/shroom`.
     pub fn default_dir() -> PathBuf {
-        std::env::var_os("XDG_DATA_HOME")
+        let base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/share")))
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("smash")
+            .unwrap_or_else(|| PathBuf::from("."));
+        adopt(&base.join("smash"), &base.join("shroom"))
     }
 
     fn path(&self, id: DocId) -> PathBuf {
@@ -67,7 +67,7 @@ impl Files {
                 .and_then(|bytes| serde_json::from_slice::<Doc>(&bytes).map_err(|e| e.to_string()));
             match parsed {
                 Ok(doc) => docs.push(doc),
-                Err(err) => eprintln!("smash: skipping {}: {err}", path.display()),
+                Err(err) => eprintln!("shroom: skipping {}: {err}", path.display()),
             }
         }
         docs.sort_by_key(|doc: &Doc| doc.id);
@@ -99,6 +99,21 @@ impl Files {
     }
 }
 
+/// shroom was called smash: the old data dir (sessions, settings, images,
+/// checkpoints) moves to the new name on first start, unless there is
+/// already data under it. Returns `dir`.
+/// ponytail: drop once no install predates the rename (2026-10).
+fn adopt(old: &Path, dir: &Path) -> PathBuf {
+    if !dir.exists() && old.is_dir() && fs::rename(old, dir).is_err() {
+        eprintln!(
+            "shroom: could not move {} to {}",
+            old.display(),
+            dir.display()
+        );
+    }
+    dir.to_path_buf()
+}
+
 impl Backend for Files {
     fn exec(&mut self, effect: Effect) -> Vec<Event> {
         match self.exec_inner(effect) {
@@ -113,8 +128,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_old_data_dir_moves_once() {
+        let base = std::env::temp_dir().join(format!("shroom-adopt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (old, dir) = (base.join("smash"), base.join("shroom"));
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("1.json"), "kept").unwrap();
+        assert_eq!(adopt(&old, &dir), dir);
+        assert_eq!(fs::read_to_string(dir.join("1.json")).unwrap(), "kept");
+        assert!(!old.exists());
+        // Data under the new name wins; a stray old dir is left alone.
+        fs::create_dir_all(&old).unwrap();
+        adopt(&old, &dir);
+        assert!(old.exists() && dir.join("1.json").exists());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn stray_files_never_hide_sessions() {
-        let dir = std::env::temp_dir().join(format!("smash-load-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-load-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("1.json"),
@@ -132,7 +164,7 @@ mod tests {
 
     #[test]
     fn saves_loads_and_drops_through_the_backend_trait() {
-        let dir = std::env::temp_dir().join(format!("smash-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut backend = Files::new(&dir);
 

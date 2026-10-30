@@ -1,6 +1,6 @@
 //! Agent loop: stream a turn, run the model's code, repeat until it answers.
 //!
-//! Tools are code (see [`smash_js`]): the model gets ONE tool, `js`, whose
+//! Tools are code (see [`shroom_js`]): the model gets ONE tool, `js`, whose
 //! argument is a JavaScript program where read/write/edit/ls/sh are async
 //! functions. One model turn can then read five files in parallel, patch two,
 //! run the tests and return only the failures, instead of the five-to-ten
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use smash_ai::{
+use shroom_ai::{
     Content, Context, Cost, Effort, Error, Event, Kind, Message, Model, Role, StopReason, Tool,
     Usage,
 };
@@ -41,9 +41,9 @@ const OVERFLOW_ATTEMPTS: u8 = 4;
 /// their thinking, so silence this long is not normal).
 const IDLE: Duration = Duration::from_secs(120);
 
-/// IDLE, shortened by `SMASH_IDLE_SECS` (fault tests).
+/// IDLE, shortened by `SHROOM_IDLE_SECS` (fault tests).
 fn idle() -> Duration {
-    std::env::var("SMASH_IDLE_SECS")
+    std::env::var("SHROOM_IDLE_SECS")
         .ok()
         .and_then(|secs| secs.parse().ok())
         .map_or(IDLE, Duration::from_secs)
@@ -84,7 +84,7 @@ pub enum Update {
         title: String,
     },
     /// One tool call inside the running program finished.
-    Call(smash_js::Call),
+    Call(shroom_js::Call),
     /// The program finished.
     ProgramDone {
         calls: usize,
@@ -105,7 +105,7 @@ pub enum Update {
     /// A queued message (see [`Inbox`]) joined the conversation as a user turn.
     Steered(String),
     /// Images the programs read: the model sees them next, the user now.
-    Shown(Vec<smash_ai::Image>),
+    Shown(Vec<shroom_ai::Image>),
     /// The history was compacted from about `before` to `after` tokens.
     Compacted {
         before: u64,
@@ -116,7 +116,7 @@ pub enum Update {
 }
 
 pub struct Agent {
-    client: smash_ai::Client,
+    client: shroom_ai::Client,
     pub model: Model,
     pub system: String,
     pub max_tokens: Option<u32>,
@@ -135,7 +135,7 @@ pub struct Agent {
     pub inbox: Inbox,
     pub max_turns: usize,
     /// Extra functions for the `js` tool (subagents).
-    pub host: Option<Arc<dyn smash_js::Host>>,
+    pub host: Option<Arc<dyn shroom_js::Host>>,
     /// `write`/`edit` refuse.
     pub read_only: bool,
     /// `write`/`edit` refuse paths outside `cwd` (its own worktree).
@@ -200,9 +200,9 @@ struct Reply {
 impl Agent {
     pub fn new(model: Model) -> Self {
         Self {
-            client: smash_ai::Client::new(),
+            client: shroom_ai::Client::new(),
             model,
-            system: SYSTEM.replace("{TOOLS}", smash_js::TOOLS),
+            system: SYSTEM.replace("{TOOLS}", shroom_js::TOOLS),
             max_tokens: None,
             effort: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -216,7 +216,7 @@ impl Agent {
             read_only: false,
             confine: false,
             cache_key: None,
-            images: std::env::temp_dir().join("smash-images"),
+            images: std::env::temp_dir().join("shroom-images"),
         }
     }
 
@@ -239,7 +239,7 @@ impl Agent {
     }
 
     /// Extra `js` functions; `docs` lists them for the model.
-    pub fn host(mut self, host: Arc<dyn smash_js::Host>, docs: &str) -> Self {
+    pub fn host(mut self, host: Arc<dyn shroom_js::Host>, docs: &str) -> Self {
         self.host = Some(host);
         self.system.push_str("\n\n");
         self.system.push_str(docs);
@@ -350,7 +350,7 @@ impl Agent {
                     "error: cancelled by the user before this call ran".to_string()
                 } else {
                     let ran = self.program(&name, &arguments, updates, cancel).await;
-                    let first = smash_ai::image::numbered(messages).count() + shown.len() + 1;
+                    let first = shroom_ai::image::numbered(messages).count() + shown.len() + 1;
                     let text = ran.text_with_labels(first);
                     shown.extend(ran.images);
                     text
@@ -359,7 +359,7 @@ impl Agent {
             }
             if !shown.is_empty() {
                 send(updates, Update::Shown(shown.clone()));
-                messages.push(smash_ai::image::user_message(SHOWN, shown));
+                messages.push(shroom_ai::image::user_message(SHOWN, shown));
             }
             if cancel.is_cancelled() {
                 return Err(cancelled());
@@ -474,7 +474,7 @@ impl Agent {
     ) -> Result<Reply, Error> {
         self.fit(messages, updates).await;
         // Over the per-request image limits: the oldest become placeholders.
-        smash_ai::image::fit(messages);
+        shroom_ai::image::fit(messages);
         let mut context = self.request(messages);
         let mut attempt = 0;
         let mut overflows = 0;
@@ -493,7 +493,7 @@ impl Agent {
             if error.kind == Kind::Request
                 && !images_refused
                 && refuses_images(&error)
-                && smash_ai::image::drop_oldest(messages, 0, "the provider refused it") > 0
+                && shroom_ai::image::drop_oldest(messages, 0, "the provider refused it") > 0
             {
                 images_refused = true;
                 attempt -= 1;
@@ -580,7 +580,7 @@ impl Agent {
                         .filter(|title| !title.trim().is_empty())
                         .or_else(|| {
                             code.contains('\n')
-                                .then(|| smash_js::title(&code))
+                                .then(|| shroom_js::title(&code))
                                 .flatten()
                         });
                     // One update per new line, not per token.
@@ -651,12 +651,12 @@ impl Agent {
                 }
             }
         };
-        let limits = smash_js::Limits {
+        let limits = shroom_js::Limits {
             read_only: self.read_only,
             confine: self.confine,
-            ..smash_js::Limits::default()
+            ..shroom_js::Limits::default()
         };
-        let run = smash_js::run_with(&code, &self.cwd, limits, log, self.host.clone());
+        let run = shroom_js::run_with(&code, &self.cwd, limits, log, self.host.clone());
         let started = std::time::Instant::now();
         let outcome = tokio::select! {
             () = cancel.cancelled() => {
@@ -688,7 +688,7 @@ impl Agent {
         let prepared = tokio::task::spawn_blocking(move || {
             files
                 .into_iter()
-                .map(|file| (smash_ai::image::prepare_file(&file, &store), file))
+                .map(|file| (shroom_ai::image::prepare_file(&file, &store), file))
                 .collect::<Vec<_>>()
         })
         .await
@@ -704,9 +704,9 @@ impl Agent {
         ran
     }
 
-    /// Where long program output is saved: `$TMPDIR/smash-output`.
+    /// Where long program output is saved: `$TMPDIR/shroom-output`.
     fn spill_dir(&self) -> PathBuf {
-        std::env::temp_dir().join("smash-output")
+        std::env::temp_dir().join("shroom-output")
     }
 }
 
@@ -717,7 +717,7 @@ const SHOWN: &str = "Images read by the programs above:";
 /// images it showed.
 struct Ran {
     text: String,
-    images: Vec<smash_ai::Image>,
+    images: Vec<shroom_ai::Image>,
 }
 
 impl Ran {
@@ -948,7 +948,7 @@ pub fn program_title(name: &str, arguments: &Value, code: &str) -> String {
         .map(|title| title.lines().next().unwrap_or_default().trim())
         .filter(|title| !title.is_empty())
         .map(|title| title.chars().take(80).collect())
-        .or_else(|| smash_js::title(code))
+        .or_else(|| shroom_js::title(code))
         .unwrap_or_else(|| match name {
             "js" => "program".into(),
             other => format!("{other} call"),
@@ -965,7 +965,7 @@ mod tests {
 
     #[test]
     fn long_output_spills_to_a_file_and_short_output_stays() {
-        let dir = std::env::temp_dir().join(format!("smash-spill-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-spill-{}", std::process::id()));
         assert_eq!(spill("short", &dir), "short");
         let long = format!("HEAD{}TAIL", "x".repeat(20_000));
         let kept = spill(&long, &dir);

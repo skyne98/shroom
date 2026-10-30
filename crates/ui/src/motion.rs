@@ -13,7 +13,7 @@
 //! seconds) and `damping` ratio (1 = fastest without overshoot, below 1
 //! overshoots a little).
 //!
-//! `SMASH_REDUCED_MOTION=1` (or `NO_MOTION`) snaps every value: motion is
+//! `SHROOM_REDUCED_MOTION=1` (or `NO_MOTION`) snaps every value: motion is
 //! never required to read the screen.
 
 use std::collections::HashMap;
@@ -176,10 +176,10 @@ impl Default for Motions {
     }
 }
 
-/// `SMASH_REDUCED_MOTION` set to anything but `0`, or `NO_MOTION` set.
+/// `SHROOM_REDUCED_MOTION` set to anything but `0`, or `NO_MOTION` set.
 pub fn reduced_from_env() -> bool {
     let set = |name: &str| std::env::var(name).is_ok_and(|value| value != "0" && !value.is_empty());
-    set("SMASH_REDUCED_MOTION") || set("NO_MOTION")
+    set("SHROOM_REDUCED_MOTION") || set("NO_MOTION")
 }
 
 impl Motions {

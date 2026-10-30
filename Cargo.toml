@@ -8,12 +8,12 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
-smash-core = { path = "crates/core" }
-smash-client = { path = "crates/client" }
-smash-backend = { path = "crates/backend" }
-smash-ext = { path = "crates/ext" }
-smash-session = { path = "crates/session" }
-smash-ui = { path = "crates/ui" }
+shroom-core = { path = "crates/core" }
+shroom-client = { path = "crates/client" }
+shroom-backend = { path = "crates/backend" }
+shroom-ext = { path = "crates/ext" }
+shroom-session = { path = "crates/session" }
+shroom-ui = { path = "crates/ui" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,7 +22,7 @@ pulldown-cmark = "0.13"
 extism = "1"
 # No default TLS: genai's default pulls aws-lc-sys, whose build script tracks
 # PKG_CONFIG_PATH, so every switch between `cargo` and `scripts/dev.sh cargo`
-# rebuilt the whole HTTP stack. smash-ai picks rustls+ring instead.
+# rebuilt the whole HTTP stack. shroom-ai picks rustls+ring instead.
 genai = { version = "0.7.0-rc.8", default-features = false, features = ["system-proxy"] }
 ratatui = "0.29"
 crossterm = "0.28"

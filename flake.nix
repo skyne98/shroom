@@ -1,5 +1,5 @@
 {
-  description = "smash: coding agent harness (terminal + desktop app)";
+  description = "shroom: coding agent harness (terminal + desktop app)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -17,16 +17,16 @@
         default = pkgs.callPackage ./nix/package.nix { };
       });
       overlays.default = final: _prev: {
-        smash = final.callPackage ./nix/package.nix { };
+        shroom = final.callPackage ./nix/package.nix { };
       };
       apps = each (pkgs: {
         default = {
           type = "app";
-          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/smash";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/shroom";
         };
         desktop = {
           type = "app";
-          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/smash-gpui";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/shroom-gpui";
         };
       });
     };

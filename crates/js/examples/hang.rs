@@ -5,7 +5,7 @@ async fn main() {
     let code = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "await Promise.all([sh('ls'), sh('sleep 1')]); return 'done'".into());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<smash_js::Call>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<shroom_js::Call>();
     let start = Instant::now();
     let watch = tokio::spawn(async move {
         while let Some(call) = rx.recv().await {
@@ -27,10 +27,10 @@ async fn main() {
             );
         }
     });
-    let outcome = smash_js::run(
+    let outcome = shroom_js::run(
         &code,
         std::path::Path::new("."),
-        smash_js::Limits {
+        shroom_js::Limits {
             timeout: Duration::from_secs(20),
             ..Default::default()
         },

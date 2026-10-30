@@ -1,7 +1,7 @@
 //! Drive the agent against a local fake provider (see /tmp/fakeprov.js).
-//!   FAKE=http://127.0.0.1:18765/v1/ cargo run -q -p smash-backend --example fault -- 5
-use smash_ai::{Message, Model};
-use smash_backend::{Agent, CancellationToken, Update};
+//!   FAKE=http://127.0.0.1:18765/v1/ cargo run -q -p shroom-backend --example fault -- 5
+use shroom_ai::{Message, Model};
+use shroom_backend::{Agent, CancellationToken, Update};
 use std::time::Instant;
 
 #[tokio::main]
@@ -62,7 +62,7 @@ async fn main() {
     }
     let tools: Vec<String> = messages
         .iter()
-        .filter(|m| m.role == smash_ai::Role::Tool)
+        .filter(|m| m.role == shroom_ai::Role::Tool)
         .map(|m| m.text())
         .collect();
     println!("tool results sent back: {tools:?}");

@@ -6,9 +6,9 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use smash_ai::Message;
-use smash_backend::agents::{DOCS, Spec, Status};
-use smash_backend::{Agent, Agents, CancellationToken, Update};
+use shroom_ai::Message;
+use shroom_backend::agents::{DOCS, Spec, Status};
+use shroom_backend::{Agent, Agents, CancellationToken, Update};
 
 fn spec(url: &str, dir: &std::path::Path) -> Spec {
     let url = url.to_string();
@@ -24,7 +24,7 @@ fn spec(url: &str, dir: &std::path::Path) -> Spec {
 }
 
 fn temp(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("smash-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("shroom-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -75,7 +75,7 @@ async fn spawn_wait_steer_and_resume_after_restart() {
     assert_eq!(run.message.text(), "parent done");
     let results: Vec<String> = messages
         .iter()
-        .filter(|m| m.role == smash_ai::Role::Tool)
+        .filter(|m| m.role == shroom_ai::Role::Tool)
         .map(Message::text)
         .collect();
     assert!(results[0].contains("SPAWNED:a1"), "{results:?}");
@@ -107,7 +107,7 @@ async fn spawn_wait_steer_and_resume_after_restart() {
     let mut statuses = Vec::new();
     while let Ok(event) = seen.try_recv() {
         match event {
-            smash_backend::agents::Event::Update {
+            shroom_backend::agents::Event::Update {
                 scope,
                 id,
                 update: Update::Steered(text),
@@ -115,7 +115,7 @@ async fn spawn_wait_steer_and_resume_after_restart() {
                 assert_eq!((scope.as_str(), id.as_str()), ("s1", "a1"));
                 steered |= text == "refine please";
             }
-            smash_backend::agents::Event::Changed { info, .. } => statuses.push(info.status),
+            shroom_backend::agents::Event::Changed { info, .. } => statuses.push(info.status),
             _ => {}
         }
     }
@@ -240,7 +240,7 @@ async fn running_limits_one_writer_and_stop() {
 
 #[test]
 fn every_subagent_shares_one_system_prompt() {
-    let system = smash_backend::agents::child_system();
+    let system = shroom_backend::agents::child_system();
     assert!(system.contains("You are a subagent"));
     assert!(
         !system.contains("read-only") && !system.contains("only agent changing"),
@@ -320,7 +320,7 @@ async fn isolated_agents_work_in_their_own_worktree() {
     assert_eq!(busy.status, Status::Idle, "{}", busy.report);
 
     let tree = busy.worktree.expect("work keeps its worktree");
-    assert_eq!(tree.branch, "smash/s-a1");
+    assert_eq!(tree.branch, "shroom/s-a1");
     assert!(tree.path.join("new.txt").exists());
     assert!(
         !repo.join("new.txt").exists(),
@@ -331,7 +331,7 @@ async fn isolated_agents_work_in_their_own_worktree() {
         "writes outside are refused"
     );
     assert!(idle.worktree.is_none(), "an empty worktree is removed");
-    assert!(!repo.join(".smash/worktrees/s-a2").exists());
+    assert!(!repo.join(".shroom/worktrees/s-a2").exists());
     // The parent merges the branch like any other.
     git(&[
         "-c",
@@ -340,7 +340,7 @@ async fn isolated_agents_work_in_their_own_worktree() {
         "user.name=t",
         "merge",
         "-q",
-        "smash/s-a1",
+        "shroom/s-a1",
     ]);
     assert!(repo.join("new.txt").exists());
     let _ = std::fs::remove_dir_all(&repo);

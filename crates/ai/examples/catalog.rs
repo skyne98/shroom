@@ -1,12 +1,12 @@
 //! Parse the real models.dev list and time it.
-//!   cargo run -q --release -p smash-ai --example catalog -- /tmp/models.json
+//!   cargo run -q --release -p shroom-ai --example catalog -- /tmp/models.json
 fn main() {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/tmp/models.json".into());
     let json = std::fs::read_to_string(&path).expect("models.dev json");
     let start = std::time::Instant::now();
-    let catalog = smash_ai::catalog::Catalog::parse(&json).expect("parse");
+    let catalog = shroom_ai::catalog::Catalog::parse(&json).expect("parse");
     let took = start.elapsed();
     let available = catalog.available();
     println!(

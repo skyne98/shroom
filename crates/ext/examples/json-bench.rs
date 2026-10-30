@@ -1,5 +1,5 @@
 //! JSON benchmark at session scale: owned vs borrowed, copy vs in-place.
-//!   cargo run -q --release -p smash-ext --example json-bench
+//!   cargo run -q --release -p shroom-ext --example json-bench
 //!
 //! Payload is a realistic session transcript: messages with text, thinking and
 //! tool-call parts, string dominated, no escapes (so an in-place parse never

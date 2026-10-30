@@ -1,10 +1,10 @@
 //! One image question against a real provider.
 //!
-//!   DEEPSEEK_API_KEY=... cargo run -p smash-backend --example see -- path/to/image.png "question"
-//!   ANTHROPIC_API_KEY=... cargo run -p smash-backend --example see -- img.png "q" anthropic claude-haiku-4-5
+//!   DEEPSEEK_API_KEY=... cargo run -p shroom-backend --example see -- path/to/image.png "question"
+//!   ANTHROPIC_API_KEY=... cargo run -p shroom-backend --example see -- img.png "q" anthropic claude-haiku-4-5
 
-use smash_ai::{Model, image};
-use smash_backend::{Agent, CancellationToken, Update};
+use shroom_ai::{Model, image};
+use shroom_backend::{Agent, CancellationToken, Update};
 
 #[tokio::main]
 async fn main() {
@@ -17,7 +17,7 @@ async fn main() {
         (Some("anthropic"), Some(id)) => Model::anthropic(id),
         _ => Model::deepseek("deepseek-flash"),
     };
-    let store = std::env::temp_dir().join("smash-see");
+    let store = std::env::temp_dir().join("shroom-see");
     // SEE_PASTE=1: treat the file as pasted bytes (no path the model knows).
     let prepared = if std::env::var_os("SEE_PASTE").is_some() {
         std::fs::read(&path)

@@ -11,18 +11,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use smash_ai::catalog::{Catalog, Entry};
-use smash_ai::{Content, Effort, Error as AiError, Kind, Message, Model, Usage};
-use smash_backend::agents::{
+use shroom_ai::catalog::{Catalog, Entry};
+use shroom_ai::{Content, Effort, Error as AiError, Kind, Message, Model, Usage};
+use shroom_backend::agents::{
     DOCS as AGENT_DOCS, Event as AgentEvent, Info as AgentInfo, Spec, Status,
 };
-use smash_backend::{
+use shroom_backend::{
     Agent, Agents, CancellationToken, Compactor, Files, Inbox, Run, Summarizer,
     Update as AgentUpdate, git,
 };
-use smash_client::Client;
-use smash_core::Action;
-use smash_core::DocId;
+use shroom_client::Client;
+use shroom_core::Action;
+use shroom_core::DocId;
 
 use crate::editor::Editor;
 use crate::layout::{self, ACCENT, DIM, Laid, Paint, Row, run};
@@ -120,7 +120,7 @@ struct AgentLive {
     started: Option<std::time::Instant>,
     /// Title of its current program (or "thinking").
     program: String,
-    calls: Vec<(smash_js::Call, std::time::Instant)>,
+    calls: Vec<(shroom_js::Call, std::time::Instant)>,
 }
 
 /// Key hints on the status bar at once.
@@ -244,7 +244,7 @@ impl Worker {
                     .context(key, window, summarizers, compactor.clone())
                     .inbox(steer)
                     .host(host, AGENT_DOCS)
-                    .cache_key(format!("smash-{doc}"))
+                    .cache_key(format!("shroom-{doc}"))
                     .images(images.clone());
                 let (result, messages) = runtime.block_on(async {
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -322,7 +322,7 @@ impl Settings {
         saved.unwrap_or_else(|| Settings {
             // `deepseek-chat` is a legacy name for deepseek-flash with thinking
             // off, which garbles ~half its answers (measured 2026-10).
-            model: std::env::var("SMASH_MODEL")
+            model: std::env::var("SHROOM_MODEL")
                 .unwrap_or_else(|_| "deepseek/deepseek-flash".into()),
             effort: None,
             details: false,
@@ -623,12 +623,12 @@ fn tokens(n: u64) -> String {
 /// A model without a catalog entry yet (offline first start): the provider
 /// from the key's prefix, DeepSeek otherwise.
 fn fallback_model(key: &str) -> Model {
-    // Any OpenAI-compatible endpoint: SMASH_MODEL=http://host:port/v1/|model
-    // with the key in SMASH_KEY (local servers, fault tests).
+    // Any OpenAI-compatible endpoint: SHROOM_MODEL=http://host:port/v1/|model
+    // with the key in SHROOM_KEY (local servers, fault tests).
     if let Some((base, id)) = key.split_once('|')
         && base.starts_with("http")
     {
-        return Model::compatible(base, "SMASH_KEY", id);
+        return Model::compatible(base, "SHROOM_KEY", id);
     }
     match key.split_once(['/', ':']) {
         Some(("anthropic", id)) => Model::anthropic(id),
@@ -646,7 +646,7 @@ enum Segment {
     /// A message the user typed while the run worked; it joined the run.
     User(String),
     /// Images the agent read: shown under the program that read them.
-    Images(Vec<smash_ai::Image>),
+    Images(Vec<shroom_ai::Image>),
     /// A one-line event (compaction, a subagent finishing): drawn like a
     /// program row, but tool calls never attach to it.
     Note {
@@ -656,7 +656,7 @@ enum Segment {
     Program {
         title: String,
         /// Calls in start order, with when each started (for running ones).
-        calls: Vec<(smash_js::Call, std::time::Instant)>,
+        calls: Vec<(shroom_js::Call, std::time::Instant)>,
         summary: Option<String>,
     },
     /// A subagent: drawn on its own rail, never like the main answer.
@@ -667,7 +667,7 @@ enum Segment {
         title: String,
         status: String,
         activity: String,
-        calls: Vec<(smash_js::Call, std::time::Instant)>,
+        calls: Vec<(shroom_js::Call, std::time::Instant)>,
     },
 }
 
@@ -676,7 +676,7 @@ fn field(text: &str) -> String {
 }
 
 /// One call line of the stored body.
-fn call_line(call: &smash_js::Call, started: std::time::Instant) -> String {
+fn call_line(call: &shroom_js::Call, started: std::time::Instant) -> String {
     let (mark, info) = match (call.running, call.ok) {
         (true, _) => (
             "…",
@@ -792,7 +792,7 @@ fn history(body: &[String]) -> Vec<Message> {
         text.clear();
     };
     let mut user = String::new();
-    let mut shown: Vec<smash_ai::Image> = Vec::new();
+    let mut shown: Vec<shroom_ai::Image> = Vec::new();
     for line in crate::transcript(body) {
         match line.role {
             Role::User => {
@@ -821,20 +821,20 @@ fn history(body: &[String]) -> Vec<Message> {
         }
         if !user.is_empty() {
             let images = std::mem::take(&mut shown);
-            messages.push(smash_ai::image::user_message(user.trim(), images));
+            messages.push(shroom_ai::image::user_message(user.trim(), images));
             user.clear();
         }
     }
     flush(&mut messages, &mut thinking, &mut text);
     if !user.trim().is_empty() || !shown.is_empty() {
-        messages.push(smash_ai::image::user_message(user.trim(), shown));
+        messages.push(shroom_ai::image::user_message(user.trim(), shown));
     }
     messages
 }
 
 /// The transcript line for an image sent with a prompt:
 /// `name\tWxH\tmime\tpath[\tsaved original]` after the `▣ ` marker.
-fn image_line(image: &smash_ai::Image) -> String {
+fn image_line(image: &shroom_ai::Image) -> String {
     let file = image
         .file
         .as_ref()
@@ -852,14 +852,14 @@ fn image_line(image: &smash_ai::Image) -> String {
 }
 
 /// The image an image line describes, if its file is still there.
-fn image_from_line(text: &str) -> Option<smash_ai::Image> {
+fn image_from_line(text: &str) -> Option<shroom_ai::Image> {
     let mut fields = text.split('\t');
     let name = fields.next()?.to_string();
     let (width, height) = fields.next()?.split_once('×')?;
     let mime = fields.next()?.to_string();
     let path = std::path::PathBuf::from(fields.next()?);
     let file = fields.next().map(std::path::PathBuf::from);
-    path.exists().then(|| smash_ai::Image {
+    path.exists().then(|| shroom_ai::Image {
         path,
         mime,
         width: width.parse().unwrap_or(0),
@@ -879,7 +879,7 @@ fn friendly_error(err: &AiError, model: &str, key_env: Option<&str>) -> String {
     };
     let key = key_env.map(String::from).unwrap_or_else(|| {
         if model.contains("://") {
-            "SMASH_KEY".into()
+            "SHROOM_KEY".into()
         } else {
             format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"))
         }
@@ -1084,10 +1084,10 @@ pub struct Chat {
     wheel_rest: f32,
     wheel_mode: Mode,
     /// Images waiting to go with the next prompt (chips above the input).
-    attached: Vec<smash_ai::Image>,
+    attached: Vec<shroom_ai::Image>,
     /// Images being prepared off the UI thread; they join `attached`.
-    preparing: Receiver<Result<smash_ai::Image, String>>,
-    prepare_tx: Sender<Result<smash_ai::Image, String>>,
+    preparing: Receiver<Result<shroom_ai::Image, String>>,
+    prepare_tx: Sender<Result<shroom_ai::Image, String>>,
     /// Attachments queued and not yet back from preparation.
     pending_images: usize,
     /// One-shot message on the status row (errors, "copied"); next input clears it.
@@ -1133,9 +1133,9 @@ impl Chat {
     /// [`Chat::open`] on another data directory (tests).
     pub fn open_in(dir: PathBuf) -> Self {
         let root = dir.clone();
-        let ext = smash_ext::Ext::load_dir(dir.join("extensions"));
-        let hooks: Box<dyn smash_core::Hooks> =
-            match smash_session::Session::create(dir.join("sessions")) {
+        let ext = shroom_ext::Ext::load_dir(dir.join("extensions"));
+        let hooks: Box<dyn shroom_core::Hooks> =
+            match shroom_session::Session::create(dir.join("sessions")) {
                 Ok(session) => Box::new((session, ext)),
                 Err(_) => Box::new(ext),
             };
@@ -1215,16 +1215,16 @@ impl Chat {
         chat
     }
 
-    /// `SMASH_PROMPT`: send this prompt at startup (screenshots, demos).
-    /// `SMASH_OPEN=models|sessions|commands` opens that list instead.
+    /// `SHROOM_PROMPT`: send this prompt at startup (screenshots, demos).
+    /// `SHROOM_OPEN=models|sessions|commands` opens that list instead.
     pub fn with_startup_prompt(mut self) -> Self {
-        match std::env::var("SMASH_OPEN").as_deref() {
+        match std::env::var("SHROOM_OPEN").as_deref() {
             Ok("models") => self.open_models(),
             Ok("sessions") => self.open_picker(),
             Ok("commands") => self.open_palette(),
             _ => {}
         }
-        if let Ok(prompt) = std::env::var("SMASH_PROMPT")
+        if let Ok(prompt) = std::env::var("SHROOM_PROMPT")
             && !prompt.trim().is_empty()
         {
             self.paste(&prompt);
@@ -1250,7 +1250,7 @@ impl Chat {
         );
         self.pending_images += 1;
         thread::spawn(move || {
-            let _ = tx.send(smash_ai::image::prepare_kept(&bytes, &name, &store));
+            let _ = tx.send(shroom_ai::image::prepare_kept(&bytes, &name, &store));
         });
     }
 
@@ -1259,7 +1259,7 @@ impl Chat {
         let (store, tx) = (self.image_store(), self.prepare_tx.clone());
         self.pending_images += 1;
         thread::spawn(move || {
-            let prepared = smash_ai::image::prepare_file(&path, &store).map_err(|why| {
+            let prepared = shroom_ai::image::prepare_file(&path, &store).map_err(|why| {
                 let name = path.file_name().map_or_else(
                     || path.display().to_string(),
                     |n| n.to_string_lossy().into_owned(),
@@ -1271,7 +1271,7 @@ impl Chat {
     }
 
     /// Images waiting to go with the next prompt.
-    pub fn attachments(&self) -> &[smash_ai::Image] {
+    pub fn attachments(&self) -> &[shroom_ai::Image] {
         &self.attached
     }
 
@@ -1334,7 +1334,7 @@ impl Chat {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 
-    /// Where smash keeps its data (clients store their own small settings).
+    /// Where shroom keeps its data (clients store their own small settings).
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
     }
@@ -1906,7 +1906,7 @@ impl Chat {
         let late = self
             .steer
             .take()
-            .map(|inbox| smash_backend::drain(&inbox))
+            .map(|inbox| shroom_backend::drain(&inbox))
             .unwrap_or_default();
         self.retrying = None;
         self.clock.finish();
@@ -1940,7 +1940,7 @@ impl Chat {
         );
         self.context.insert(
             doc,
-            smash_backend::compact::estimate(&messages) as f64 / limit as f64,
+            shroom_backend::compact::estimate(&messages) as f64 / limit as f64,
         );
         // The agent leaves `messages` valid even after an error (every tool
         // call answered), so a continue picks up with full tool context.
@@ -2698,7 +2698,7 @@ impl Chat {
                 .or_else(|| self.load_conversation(doc))
                 .filter(|messages| {
                     messages.get(mark.messages).is_some_and(|next| {
-                        next.role == smash_ai::Role::User
+                        next.role == shroom_ai::Role::User
                             && next.text().trim_start().starts_with(mark.prompt.trim())
                     })
                 })
@@ -2795,7 +2795,7 @@ impl Chat {
 
     /// A fresh session; an empty one is reused, so they never pile up.
     fn new_session(&mut self) {
-        let empty = |doc: &smash_core::Doc| doc.body.trim().is_empty();
+        let empty = |doc: &shroom_core::Doc| doc.body.trim().is_empty();
         if self.client.app().selected().is_some_and(empty) {
             self.notice = Some("this session is still empty · type to start".into());
             return;
@@ -2988,7 +2988,7 @@ impl Chat {
         // `@path` to an image attaches it; the words stay in the prompt.
         let mut images = std::mem::take(&mut self.attached);
         for path in mentioned_images(&prompt, &self.cwd()) {
-            match smash_ai::image::prepare_file(&path, &self.image_store()) {
+            match shroom_ai::image::prepare_file(&path, &self.image_store()) {
                 Ok(image) => images.push(image),
                 Err(why) => {
                     self.attached = images;
@@ -3043,7 +3043,7 @@ impl Chat {
         }
         let body = self.client.app().selected().map_or(0, |doc| doc.body.len());
         let mark = git::Mark::new(if resume { "" } else { &prompt }, body, messages.len());
-        messages.push(smash_ai::image::user_message(&prompt, images));
+        messages.push(shroom_ai::image::user_message(&prompt, images));
         self.dispatch(Action::Append(turn));
         // An unnamed session takes its first prompt as its name.
         if let Some(doc) = self.client.app().selected()
@@ -3607,7 +3607,12 @@ impl Chat {
 
     /// The status row and its click zones: each hint presses its key, the
     /// session name opens the picker.
-    fn status(&mut self, cols: usize, has_code: bool, view: &smash_core::View) -> (Row, Vec<Zone>) {
+    fn status(
+        &mut self,
+        cols: usize,
+        has_code: bool,
+        view: &shroom_core::View,
+    ) -> (Row, Vec<Zone>) {
         let typing = match self.mode {
             Mode::Picker => self.picker.query_typed(),
             Mode::Chat => !self.editor.is_empty(),
@@ -3733,7 +3738,7 @@ mod tests {
                 title: "read config".into(),
                 calls: vec![
                     (
-                        smash_js::Call {
+                        shroom_js::Call {
                             id: 0,
                             running: false,
                             verb: "read".into(),
@@ -3744,7 +3749,7 @@ mod tests {
                         std::time::Instant::now(),
                     ),
                     (
-                        smash_js::Call {
+                        shroom_js::Call {
                             id: 1,
                             running: false,
                             verb: "sh".into(),
@@ -3842,7 +3847,7 @@ mod tests {
         );
         let (chat, dir) = super::motion_tests::chat_in_dir();
         let mut chat = chat.with_mouse().with_reduced_motion(true);
-        chat.dispatch(smash_core::Action::Append(body));
+        chat.dispatch(shroom_core::Action::Append(body));
         let text = |chat: &mut super::Chat| -> Vec<String> {
             let frame = chat.frame(80, 20);
             frame
@@ -3897,7 +3902,7 @@ mod tests {
 
     #[test]
     fn the_answer_in_flight_shows_only_its_current_step() {
-        use smash_backend::Update;
+        use shroom_backend::Update;
         let (chat, dir) = super::motion_tests::chat_in_dir();
         let mut chat = chat.with_reduced_motion(true);
         chat.paste("go");
@@ -3971,8 +3976,8 @@ mod tests {
         .map(String::from)
         .collect();
         let messages = history(&body);
-        let roles: Vec<smash_ai::Role> = messages.iter().map(|message| message.role).collect();
-        use smash_ai::Role::*;
+        let roles: Vec<shroom_ai::Role> = messages.iter().map(|message| message.role).collect();
+        use shroom_ai::Role::*;
         assert_eq!(roles, [User, Assistant, User]);
         assert_eq!(
             messages[1].text(),
@@ -3980,7 +3985,7 @@ mod tests {
             "tool logs are not replayed as text"
         );
         assert!(
-            matches!(&messages[1].content[0], smash_ai::Content::Thinking { text } if text.contains("then answer"))
+            matches!(&messages[1].content[0], shroom_ai::Content::Thinking { text } if text.contains("then answer"))
         );
         assert_eq!(messages[2].text(), "next");
     }
@@ -4014,7 +4019,7 @@ mod motion_tests {
 
     use super::{Chat, Frame, Key, Mods};
     use crate::NIGHT;
-    use smash_core::Action;
+    use shroom_core::Action;
 
     const COLS: usize = 60;
     const ROWS: usize = 16;
@@ -4023,7 +4028,7 @@ mod motion_tests {
     fn chat() -> (Chat, std::path::PathBuf) {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("smash-motion-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-motion-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         (Chat::open_in(dir.clone()).with_reduced_motion(false), dir)
     }
@@ -4070,7 +4075,7 @@ mod motion_tests {
 
     #[test]
     fn the_program_shows_while_it_is_written_then_runs_in_place() {
-        use smash_backend::Update;
+        use shroom_backend::Update;
         let (mut chat, dir) = chat();
         chat.apply(Update::Drafting {
             title: None,
@@ -4088,7 +4093,7 @@ mod motion_tests {
         assert_eq!(chat.live.len(), 1, "the draft becomes the program");
         assert!(!chat.drafting());
         chat.apply(Update::Compacting);
-        chat.apply(Update::Call(smash_js::Call {
+        chat.apply(Update::Call(shroom_js::Call {
             id: 0,
             running: true,
             verb: "sh".into(),
@@ -4114,7 +4119,7 @@ mod motion_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn agent(id: &str, status: smash_backend::agents::Status) -> super::AgentInfo {
+    fn agent(id: &str, status: shroom_backend::agents::Status) -> super::AgentInfo {
         super::AgentInfo {
             id: id.into(),
             title: format!("Title of {id}"),
@@ -4130,8 +4135,8 @@ mod motion_tests {
         }
     }
 
-    fn call(id: usize, running: bool) -> smash_backend::Update {
-        smash_backend::Update::Call(smash_js::Call {
+    fn call(id: usize, running: bool) -> shroom_backend::Update {
+        shroom_backend::Update::Call(shroom_js::Call {
             id,
             running,
             verb: "sh".into(),
@@ -4143,7 +4148,7 @@ mod motion_tests {
 
     #[test]
     fn subagents_live_in_a_fixed_dock_that_never_moves_the_transcript() {
-        use smash_backend::agents::{Event, Status};
+        use shroom_backend::agents::{Event, Status};
         let (mut chat, dir) = chat();
         chat.dispatch(Action::Append(lines(40)));
         let doc = chat.client.app().selected().unwrap().id;
@@ -4210,7 +4215,7 @@ mod motion_tests {
 
     #[test]
     fn exact_conversations_survive_a_restart() {
-        use smash_ai::{Content, Message};
+        use shroom_ai::{Content, Message};
         let (chat, dir) = chat();
         let doc = chat.client.app().selected().unwrap().id;
         let exact = vec![
@@ -4452,7 +4457,7 @@ mod motion_tests {
 
     #[test]
     fn rewinding_the_chat_fades_it_back_in_with_the_prompt_in_the_box() {
-        use smash_ai::Message;
+        use shroom_ai::Message;
         let (mut chat, dir) = chat();
         let doc = chat.client.app().selected().unwrap().id;
         // Two prompts; the second is where we go back to.
@@ -4466,20 +4471,20 @@ mod motion_tests {
             crate::user_turn("two")
         )));
         let marks = chat.checkpoints(doc);
-        smash_backend::git::save_marks(
+        shroom_backend::git::save_marks(
             &marks,
             &[
-                smash_backend::git::Mark::new("one", 0, 0),
-                smash_backend::git::Mark::new("two", body, 2),
+                shroom_backend::git::Mark::new("one", 0, 0),
+                shroom_backend::git::Mark::new("two", body, 2),
             ],
         );
         let exact = vec![
             Message::user("one"),
-            Message::assistant(vec![smash_ai::Content::Text {
+            Message::assistant(vec![shroom_ai::Content::Text {
                 text: "first answer".into(),
             }]),
             Message::user("two"),
-            Message::assistant(vec![smash_ai::Content::Text {
+            Message::assistant(vec![shroom_ai::Content::Text {
                 text: "second answer".into(),
             }]),
         ];
@@ -4516,7 +4521,7 @@ mod motion_tests {
         );
         assert_eq!(chat.load_conversation(doc).unwrap(), exact[..2].to_vec());
         assert_eq!(
-            smash_backend::git::marks(&marks).len(),
+            shroom_backend::git::marks(&marks).len(),
             1,
             "later marks dropped"
         );
@@ -4750,7 +4755,7 @@ mod motion_tests {
 #[cfg(test)]
 mod key_tests {
     use super::{Chat, Key, Mode, Mods, Outcome, Pick};
-    use smash_core::Action;
+    use shroom_core::Action;
 
     const CTRL: Mods = Mods {
         ctrl: true,
@@ -4766,7 +4771,7 @@ mod key_tests {
     fn chat() -> (Chat, std::path::PathBuf) {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("smash-keys-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-keys-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         (Chat::open_in(dir.clone()), dir)
     }
@@ -4834,7 +4839,7 @@ mod key_tests {
         let all = sessions(&chat);
         assert_eq!(all.len(), 3);
         let doomed = chat.client.app().selected().unwrap().id;
-        chat.save_conversation(doomed, &[smash_ai::Message::user("x")]);
+        chat.save_conversation(doomed, &[shroom_ai::Message::user("x")]);
 
         chat.key(Key::Char('s'), CTRL);
         assert_eq!(chat.pick, Pick::Sessions);
@@ -4952,7 +4957,7 @@ mod key_tests {
 
     #[test]
     fn model_rows_line_up_and_keep_their_marks() {
-        use smash_ai::catalog::Entry;
+        use shroom_ai::catalog::Entry;
         let entry = |name: &str, provider: &str, context: u64, vision: bool, thinks: bool| Entry {
             provider: provider.into(),
             provider_name: provider.into(),
@@ -4961,13 +4966,13 @@ mod key_tests {
             env: Vec::new(),
             api: None,
             efforts: if thinks {
-                vec![smash_ai::Effort::High]
+                vec![shroom_ai::Effort::High]
             } else {
                 Vec::new()
             },
             context,
             output: 0,
-            price: Some(smash_ai::Price {
+            price: Some(shroom_ai::Price {
                 input: 0.15,
                 output: 0.6,
                 cache_read: 0.0,
@@ -5280,12 +5285,12 @@ mod key_tests {
 mod wide_tests {
     use super::{COLUMN, Chat, Key, Mode, Mods};
     use crate::layout::width;
-    use smash_core::Action;
+    use shroom_core::Action;
 
     fn chat() -> (Chat, std::path::PathBuf) {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("smash-wide-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-wide-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut chat = Chat::open_in(dir.clone())
             .with_mouse()
@@ -5384,7 +5389,7 @@ mod image_tests {
     fn setup() -> (Chat, std::path::PathBuf, std::path::PathBuf) {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("smash-attach-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-attach-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let png = dir.join("my shot.png");
@@ -5499,7 +5504,7 @@ mod image_tests {
             rebuilt[0]
                 .content
                 .iter()
-                .any(|c| matches!(c, smash_ai::Content::Image(i) if i.name == "clipboard" && i.file.is_some()))
+                .any(|c| matches!(c, shroom_ai::Content::Image(i) if i.name == "clipboard" && i.file.is_some()))
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5549,9 +5554,9 @@ mod image_tests {
 
     #[test]
     fn images_the_agent_reads_show_under_its_program() {
-        use smash_backend::Update;
+        use shroom_backend::Update;
         let (mut chat, dir, png) = setup();
-        let image = smash_ai::image::prepare_file(&png, &dir.join("store")).unwrap();
+        let image = shroom_ai::image::prepare_file(&png, &dir.join("store")).unwrap();
         chat.apply(Update::Program {
             title: "Read the image file".into(),
         });

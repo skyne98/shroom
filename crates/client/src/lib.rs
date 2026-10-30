@@ -1,6 +1,6 @@
 //! Client runtime shared by every frontend.
 
-use smash_core::{Action, App, Effect, Event, Hooks, View};
+use shroom_core::{Action, App, Effect, Event, Hooks, View};
 
 /// Where effects go. In-process today; a socket/daemon transport slots in here
 /// without touching either client or the core.

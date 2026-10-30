@@ -1,4 +1,4 @@
-//! Markdown parse speed: cargo run -q --release -p smash-ui --example md-bench
+//! Markdown parse speed: cargo run -q --release -p shroom-ui --example md-bench
 
 use std::time::Instant;
 
@@ -17,13 +17,13 @@ fn main() {
         let source = document(repeats);
         let bytes = source.len();
         for _ in 0..5 {
-            std::hint::black_box(smash_ui::markdown::markdown(&source));
+            std::hint::black_box(shroom_ui::markdown::markdown(&source));
         }
         let runs = 50;
         let start = Instant::now();
         let mut blocks = 0;
         for _ in 0..runs {
-            blocks = smash_ui::markdown::markdown(&source).len();
+            blocks = shroom_ui::markdown::markdown(&source).len();
         }
         let elapsed = start.elapsed().as_secs_f64() / runs as f64;
         println!(

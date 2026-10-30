@@ -135,7 +135,7 @@ fn make(path: &Path, cols: usize, rows: usize) -> Result<Thumb, String> {
     let png = if format == ImageFormat::Png {
         path.to_path_buf()
     } else {
-        let dir = std::env::temp_dir().join("smash-thumbs");
+        let dir = std::env::temp_dir().join("shroom-thumbs");
         std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
         let stem = path
             .file_stem()
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn previews_are_exact_half_blocks_with_a_png_beside_them() {
-        let dir = std::env::temp_dir().join(format!("smash-thumbs-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-thumbs-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Top half red, bottom half blue.
         let picture = image::RgbImage::from_fn(40, 20, |_, y| {

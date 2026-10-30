@@ -11,12 +11,12 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 
-use smash_ui::chat::Shown;
+use shroom_ui::chat::Shown;
 
-/// Whether this terminal draws kitty-protocol images; `SMASH_IMAGES=off`
+/// Whether this terminal draws kitty-protocol images; `SHROOM_IMAGES=off`
 /// forces half blocks, `=kitty` forces images.
 pub fn supported() -> bool {
-    match std::env::var("SMASH_IMAGES").as_deref() {
+    match std::env::var("SHROOM_IMAGES").as_deref() {
         Ok("off" | "0" | "none") => return false,
         Ok("kitty") => return true,
         _ => {}
@@ -127,7 +127,7 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smash_ui::layout::Picture;
+    use shroom_ui::layout::Picture;
 
     fn shown(row: usize, skip: usize) -> Shown {
         Shown {

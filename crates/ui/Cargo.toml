@@ -1,19 +1,19 @@
 [package]
-name = "smash-ui"
+name = "shroom-ui"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-smash-js = { path = "../js" }
+shroom-js = { path = "../js" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-smash-core = { workspace = true }
-smash-client = { workspace = true }
-smash-backend = { workspace = true }
-smash-ext = { workspace = true }
-smash-session = { workspace = true }
-smash-ai = { path = "../ai" }
+shroom-core = { workspace = true }
+shroom-client = { workspace = true }
+shroom-backend = { workspace = true }
+shroom-ext = { workspace = true }
+shroom-session = { workspace = true }
+shroom-ai = { path = "../ai" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-onig"] }

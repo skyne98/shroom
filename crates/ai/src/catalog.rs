@@ -275,7 +275,7 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"{
-      "deepseek": { "id": "deepseek", "name": "DeepSeek", "env": ["SMASH_TEST_NO_SUCH_KEY"],
+      "deepseek": { "id": "deepseek", "name": "DeepSeek", "env": ["SHROOM_TEST_NO_SUCH_KEY"],
         "api": "https://api.deepseek.com", "models": {
           "deepseek-flash": { "id": "deepseek-flash", "name": "DeepSeek V4.1 Flash", "reasoning": true,
             "reasoning_options": [{"type":"toggle"},{"type":"effort","values":["low","high","max"]}],

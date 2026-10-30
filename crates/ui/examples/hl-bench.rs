@@ -1,9 +1,9 @@
-//! cargo run --release -p smash-ui --example hl-bench
+//! cargo run --release -p shroom-ui --example hl-bench
 fn main() {
     let code = include_str!("../src/markdown.rs");
-    smash_ui::highlight::highlight("rust", "fn warm() {}");
+    shroom_ui::highlight::highlight("rust", "fn warm() {}");
     let start = std::time::Instant::now();
-    let lines = smash_ui::highlight::highlight("rust", code);
+    let lines = shroom_ui::highlight::highlight("rust", code);
     let took = start.elapsed();
     println!(
         "{} lines, {} KB in {:?} ({:.1} MB/s)",

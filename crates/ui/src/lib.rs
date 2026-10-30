@@ -290,7 +290,7 @@ pub struct Item {
 /// Every space-separated word of the query must appear in order as a
 /// subsequence (`nse` finds "New session"). A contiguous match beats a
 /// scattered one, and characters at word starts weigh most, so `sm` ranks
-/// "Switch model" above "smash".
+/// "Switch model" above "shroom".
 pub fn fuzzy(query: &str, label: &str) -> Option<i64> {
     let text: Vec<char> = label.to_lowercase().chars().collect();
     let joined: String = text.iter().collect();

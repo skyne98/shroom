@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::Value;
-use smash_ai::{Client, Content, Context, Effort, Error, Event, Kind, Message, Model, Role, Tool};
+use shroom_ai::{Client, Content, Context, Effort, Error, Event, Kind, Message, Model, Role, Tool};
 use tokio::task::JoinHandle;
 
 /// Start the background summary at this share of the limit...
@@ -365,7 +365,7 @@ fn blocks(messages: &[Message]) -> Vec<String> {
         .map(|message| match message.role {
             Role::User => {
                 let mut text = message.text();
-                for (number, image) in smash_ai::image::numbered(std::slice::from_ref(message)) {
+                for (number, image) in shroom_ai::image::numbered(std::slice::from_ref(message)) {
                     text.push_str(&format!(
                         "\n{} (image file: {})",
                         image.label(number),
@@ -513,8 +513,8 @@ async fn summarize_any(
 }
 
 fn log(name: &str, what: &str) {
-    if std::env::var_os("SMASH_AI_DEBUG").is_some() {
-        eprintln!("[smash] summarizer {name} failed: {what}");
+    if std::env::var_os("SHROOM_AI_DEBUG").is_some() {
+        eprintln!("[shroom] summarizer {name} failed: {what}");
     }
 }
 

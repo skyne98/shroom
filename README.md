@@ -1,57 +1,57 @@
-# smash
+# shroom
 
 ```
-smash-tui   smash-gpui        frontends: paint View, map input to Action
+shroom-tui   shroom-gpui        frontends: paint View, map input to Action
      \       /
-    smash-client              runtime: state + hooks + effect dispatch
+    shroom-client              runtime: state + hooks + effect dispatch
           |
-    smash-core                state machine, Action/Effect/Event/View. no I/O, no pixels
+    shroom-core                state machine, Action/Effect/Event/View. no I/O, no pixels
           |
-    smash-backend             engine: executes effects (files today, daemon later)
+    shroom-backend             engine: executes effects (files today, daemon later)
           |
-    smash-ext                 wasm plugins on every action and every frame
+    shroom-ext                 wasm plugins on every action and every frame
 ```
 
 | crate | role |
 |---|---|
-| smash-core | domain, App reducer, view model. Pure. |
-| smash-client | Client: owns App, runs hooks, forwards effects to a Backend. |
-| smash-backend | the Backend: file store in ~/.local/share/smash. |
-| smash-ext | extism host; Hooks impl that chains wasm plugins. |
-| smash-session | append-only JSONL log; `Hooks` impl that records every action and event. |
-| smash-tui | ratatui binary. |
-| smash-gpui | gpui binary (zeron fork: zeronsh/zui). |
+| shroom-core | domain, App reducer, view model. Pure. |
+| shroom-client | Client: owns App, runs hooks, forwards effects to a Backend. |
+| shroom-backend | the Backend: file store in ~/.local/share/shroom. |
+| shroom-ext | extism host; Hooks impl that chains wasm plugins. |
+| shroom-session | append-only JSONL log; `Hooks` impl that records every action and event. |
+| shroom-tui | ratatui binary. |
+| shroom-gpui | gpui binary (zeron fork: zeronsh/zui). |
 
 A frontend only does two things: client.view() -> paint, input -> client.dispatch(action).
 New feature = one Action in core, its Effect handler in backend, one arm per frontend paint.
 
 ## Extensions
 
-Drop *.wasm into $XDG_DATA_HOME/smash/extensions (or ~/.local/share/smash/extensions).
+Drop *.wasm into $XDG_DATA_HOME/shroom/extensions (or ~/.local/share/shroom/extensions).
 Both hooks are optional, JSON in / JSON out, chained in load order:
 
-- smash_action(Action) -> Action: inspect or rewrite any action. Empty reply keeps it, null drops it.
-- smash_view(View) -> View: decorate every frame: rows, status, title.
+- shroom_action(Action) -> Action: inspect or rewrite any action. Empty reply keeps it, null drops it.
+- shroom_view(View) -> View: decorate every frame: rows, status, title.
 
 ## Install (Nix)
 
 ```sh
-nix run github:skyne98/smash            # terminal app (smash)
-nix run github:skyne98/smash#desktop    # desktop app (smash-gpui)
-nix profile install github:skyne98/smash
+nix run github:skyne98/shroom            # terminal app (shroom)
+nix run github:skyne98/shroom#desktop    # desktop app (shroom-gpui)
+nix profile install github:skyne98/shroom
 ```
 
-NixOS flake: add the input `smash.url = "github:skyne98/smash"` (with
-`smash.inputs.nixpkgs.follows = "nixpkgs"`) and put
-`inputs.smash.packages.${system}.default` in your packages, or use
+NixOS flake: add the input `shroom.url = "github:skyne98/shroom"` (with
+`shroom.inputs.nixpkgs.follows = "nixpkgs"`) and put
+`inputs.shroom.packages.${system}.default` in your packages, or use
 `overlays.default`. The desktop app gets a launcher entry. API keys come from
 the environment (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, ...).
 
 ## Run
 
 ```sh
-cargo run -p smash-tui
-cargo run -p smash-gpui      # NixOS: scripts/dev.sh cargo run -p smash-gpui
+cargo run -p shroom-tui
+cargo run -p shroom-gpui      # NixOS: scripts/dev.sh cargo run -p shroom-gpui
 ```
 
 `scripts/dev.sh` is NixOS-only: it puts fontconfig/freetype/xkbcommon on

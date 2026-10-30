@@ -1,5 +1,5 @@
 [package]
-name = "smash-js"
+name = "shroom-js"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

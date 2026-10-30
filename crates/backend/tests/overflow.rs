@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod common;
 
-use smash_ai::{Message, Role};
-use smash_backend::compact::PREFIX;
-use smash_backend::{Agent, CancellationToken, Compactor, Summarizer, Update};
+use shroom_ai::{Message, Role};
+use shroom_backend::compact::PREFIX;
+use shroom_backend::{Agent, CancellationToken, Compactor, Summarizer, Update};
 
 /// The fake model's real limit, in tokens, and the request size that breaks it.
 const LIMIT: u64 = 16_384;
@@ -51,7 +51,7 @@ async fn serve(seen: Arc<Seen>) -> String {
 async fn run(
     agent: &Agent,
     messages: &mut Vec<Message>,
-) -> (Result<smash_backend::Run, smash_ai::Error>, Vec<Update>) {
+) -> (Result<shroom_backend::Run, shroom_ai::Error>, Vec<Update>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let result = agent.run(messages, &tx, &CancellationToken::new()).await;
     drop(tx);
@@ -67,7 +67,7 @@ async fn overflow_is_absorbed_once_and_never_repeats() {
     let seen = Arc::new(Seen::default());
     let url = serve(seen.clone()).await;
     let model = || common::model(&url);
-    let dir = std::env::temp_dir().join(format!("smash-overflow-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("shroom-overflow-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let limits = dir.join("limits.json");
     let compactor = Arc::new(Compactor::new(Some(limits.clone())));
@@ -85,7 +85,7 @@ async fn overflow_is_absorbed_once_and_never_repeats() {
             "here is the log:\n{}",
             "line of log output\n".repeat(6_000)
         )),
-        Message::assistant(vec![smash_ai::Content::Text {
+        Message::assistant(vec![shroom_ai::Content::Text {
             text: "read it".into(),
         }]),
         Message::user("what failed?"),
@@ -182,7 +182,7 @@ async fn the_chat_model_compacts_inside_its_own_cached_conversation() {
     // About 85 % of the window: past SWAP, still fits the provider.
     let mut messages = vec![
         Message::user(format!("log:\n{}", "a line of log output\n".repeat(1_700))),
-        Message::assistant(vec![smash_ai::Content::Text {
+        Message::assistant(vec![shroom_ai::Content::Text {
             text: "read".into(),
         }]),
         Message::user("what failed?"),

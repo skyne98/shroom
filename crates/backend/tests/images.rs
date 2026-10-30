@@ -6,8 +6,8 @@ mod common;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use smash_ai::{Content, image};
-use smash_backend::{Agent, CancellationToken};
+use shroom_ai::{Content, image};
+use shroom_backend::{Agent, CancellationToken};
 
 fn png() -> Vec<u8> {
     let mut out = Vec::new();
@@ -22,7 +22,7 @@ fn png() -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn images_are_sent_and_a_refused_one_becomes_a_placeholder() {
-    let dir = std::env::temp_dir().join(format!("smash-img-it-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("shroom-img-it-{}", std::process::id()));
     let shot = image::prepare(&png(), "shot.png", &dir).unwrap();
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -68,7 +68,7 @@ async fn images_are_sent_and_a_refused_one_becomes_a_placeholder() {
 /// the UI hears about them, and the conversation only grows at the end.
 #[tokio::test(flavor = "multi_thread")]
 async fn images_a_program_reads_follow_its_result() {
-    let dir = std::env::temp_dir().join(format!("smash-img-show-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("shroom-img-show-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("before.png"), png()).unwrap();
     std::fs::write(dir.join("after.png"), png()).unwrap();
@@ -90,7 +90,7 @@ async fn images_a_program_reads_follow_its_result() {
     let agent = Agent::new(common::model(&url))
         .cwd(&dir)
         .images(dir.join("store"));
-    let mut messages = vec![smash_ai::Message::user("compare them")];
+    let mut messages = vec![shroom_ai::Message::user("compare them")];
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     agent
         .run(&mut messages, &tx, &CancellationToken::new())
@@ -99,13 +99,13 @@ async fn images_a_program_reads_follow_its_result() {
     drop(tx);
     let mut heard = Vec::new();
     while let Some(update) = rx.recv().await {
-        if let smash_backend::Update::Shown(images) = update {
+        if let shroom_backend::Update::Shown(images) = update {
             heard.extend(images.into_iter().map(|image| image.name));
         }
     }
     assert_eq!(heard.len(), 2, "the UI is told, so the user sees them too");
 
-    use smash_ai::Role::*;
+    use shroom_ai::Role::*;
     let roles: Vec<_> = messages.iter().map(|m| m.role).collect();
     assert_eq!(
         roles,

@@ -1,11 +1,11 @@
 //! Cache probe: a few user turns against DeepSeek, printing prompt-cache
 //! hits per model call. A miss beyond the new tokens means the prefix changed.
 //!
-//!   DEEPSEEK_API_KEY=... cargo run -p smash-backend --example cache
-//!   ANTHROPIC_API_KEY=... cargo run -p smash-backend --example cache -- anthropic claude-haiku-4-5
+//!   DEEPSEEK_API_KEY=... cargo run -p shroom-backend --example cache
+//!   ANTHROPIC_API_KEY=... cargo run -p shroom-backend --example cache -- anthropic claude-haiku-4-5
 
-use smash_ai::{Message, Model};
-use smash_backend::{Agent, CancellationToken, Update};
+use shroom_ai::{Message, Model};
+use shroom_backend::{Agent, CancellationToken, Update};
 
 #[tokio::main]
 async fn main() {
@@ -15,12 +15,12 @@ async fn main() {
         (Some("openai"), Some(id)) => Model::openai(id),
         _ => Model::deepseek("deepseek-flash"),
     };
-    let agent = Agent::new(model).cache_key("smash-cache-probe");
+    let agent = Agent::new(model).cache_key("shroom-cache-probe");
     let turns = [
         "Read Cargo.toml with one js call, then say which crates exist in one sentence.",
         "Now read crates/core/src/lib.rs with one js call and say what App does in one sentence.",
         "Now run wc -l on crates/*/src/lib.rs with one js call and name the biggest file.",
-        "Last: with one js call, grep which Cargo.toml files depend on smash-ai, and list them.",
+        "Last: with one js call, grep which Cargo.toml files depend on shroom-ai, and list them.",
     ];
     let mut messages = Vec::new();
     let mut call = 0;
@@ -28,7 +28,7 @@ async fn main() {
         messages.push(Message::user(prompt));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let printer = tokio::spawn(async move {
-            let mut last = smash_ai::Usage::default();
+            let mut last = shroom_ai::Usage::default();
             let mut rows = Vec::new();
             while let Some(update) = rx.recv().await {
                 if let Update::Usage(total) = update {

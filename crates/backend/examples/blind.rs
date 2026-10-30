@@ -1,21 +1,21 @@
 //! What a text-only model does with an image: metadata only, live.
 //!
-//!   DEEPSEEK_API_KEY=... cargo run -p smash-backend --example blind -- image.png
+//!   DEEPSEEK_API_KEY=... cargo run -p shroom-backend --example blind -- image.png
 
-use smash_ai::{Message, image};
-use smash_backend::{Agent, CancellationToken};
+use shroom_ai::{Message, image};
+use shroom_backend::{Agent, CancellationToken};
 
 #[tokio::main]
 async fn main() {
     let path = std::env::args().nth(1).expect("an image path");
-    let cache = smash_backend::Files::default_dir().join("models.json");
-    let catalog = smash_ai::catalog::Catalog::load(&cache).expect("models.json (run smash once)");
+    let cache = shroom_backend::Files::default_dir().join("models.json");
+    let catalog = shroom_ai::catalog::Catalog::load(&cache).expect("models.json (run shroom once)");
     let entry = catalog
         .find("deepseek/deepseek-v4-pro")
         .expect("deepseek-v4-pro in the catalog");
     let model = entry.model().expect("callable");
     println!("{} sees images: {}", entry.key(), model.sees_images());
-    let store = std::env::temp_dir().join("smash-blind");
+    let store = std::env::temp_dir().join("shroom-blind");
     let bytes = std::fs::read(&path).expect("readable");
     let shot = image::prepare_kept(&bytes, "clipboard", &store).expect("an image");
     let mut messages: Vec<Message> = vec![image::user_message(

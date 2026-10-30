@@ -1,4 +1,4 @@
-# Images in smash
+# Images in shroom
 
 > Paste, drop or `read()` an image. The model sees it, you see it, and the
 > prompt cache keeps it cheap. Same behaviour in the terminal and the window.
@@ -117,7 +117,7 @@ The model gets one line per image instead of the image; nothing else is called:
 ## 3 · Data model
 
 ```rust
-// smash-ai
+// shroom-ai
 pub enum Content {
     Text { text: String },
     Thinking { text: String },

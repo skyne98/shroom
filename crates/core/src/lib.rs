@@ -229,7 +229,7 @@ impl App {
 
     pub fn view(&self) -> View {
         View {
-            title: "smash".into(),
+            title: "shroom".into(),
             rows: self
                 .docs
                 .iter()

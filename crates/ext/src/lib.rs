@@ -3,9 +3,9 @@
 //! Two hooks, both optional, both JSON in / JSON out — a plugin is any wasm
 //! module (extism PDK, any language) that exports either:
 //!
-//! * `smash_action` — receives an [`Action`], returns an [`Action`]. Empty reply
+//! * `shroom_action` — receives an [`Action`], returns an [`Action`]. Empty reply
 //!   keeps the previous value; `null` drops the action.
-//! * `smash_view` — receives the [`View`], returns a [`View`]. Add rows, change
+//! * `shroom_view` — receives the [`View`], returns a [`View`]. Add rows, change
 //!   the status line, replace the title.
 //!
 //! That is the whole "extend anything" surface: every action and every frame
@@ -14,10 +14,10 @@
 use std::path::Path;
 
 use extism::{Function, Manifest, Plugin, Wasm};
-use smash_core::{Action, Hooks, View};
+use shroom_core::{Action, Hooks, View};
 
-pub const ACTION_HOOK: &str = "smash_action";
-pub const VIEW_HOOK: &str = "smash_view";
+pub const ACTION_HOOK: &str = "shroom_action";
+pub const VIEW_HOOK: &str = "shroom_view";
 
 #[derive(Default)]
 pub struct Ext {

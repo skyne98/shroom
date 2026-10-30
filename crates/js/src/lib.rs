@@ -1021,7 +1021,7 @@ mod tests {
         let outcome = run_with(
             "await write('in/a.txt', 'x'); \
              let up; try { await write('../escape.txt', 'x') } catch (x) { up = x.message } \
-             let abs; try { await write('/tmp/smash-escape.txt', 'x') } catch (x) { abs = x.message } \
+             let abs; try { await write('/tmp/shroom-escape.txt', 'x') } catch (x) { abs = x.message } \
              await write('in/../b.txt', 'y'); return [up, abs]",
             &dir,
             Limits {
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     fn temp() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("smash-js-{}-{}", std::process::id(), rand()));
+        let dir = std::env::temp_dir().join(format!("shroom-js-{}-{}", std::process::id(), rand()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1219,7 +1219,7 @@ mod tests {
             .args(["-f", "sleep 30"])
             .status();
 
-        let marker = format!("smash-orphan-{}", std::process::id());
+        let marker = format!("shroom-orphan-{}", std::process::id());
         let (timed, _) = script(
             &format!(
                 "await sh('bash -c \"sleep 40; echo {marker}\" & sleep 40', {{timeout: 300}})"

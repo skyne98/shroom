@@ -2,7 +2,7 @@
 //! byte the same on every request (so the prompt cache keeps them cheap).
 //!
 //! The rules follow what Codex, pi, opencode and Claude Code converged on
-//! (see the smash `docs/images.md` survey):
+//! (see the shroom `docs/images.md` survey):
 //! - an image that already fits is sent untouched;
 //! - otherwise it is turned upright (EXIF), shrunk to MAX_SIDE with Lanczos3,
 //!   kept in its format (PNG for GIF and WebP), and stepped down through JPEG
@@ -138,7 +138,7 @@ pub fn prepare(bytes: &[u8], name: &str, store: &Path) -> Result<Image, String> 
         return Err(format!("it is over {} MB", MAX_SOURCE / (1024 * 1024)));
     }
     let format = image::guess_format(bytes)
-        .map_err(|_| "it is not an image smash can read (PNG, JPEG, GIF, WebP)".to_string())?;
+        .map_err(|_| "it is not an image shroom can read (PNG, JPEG, GIF, WebP)".to_string())?;
     if !matches!(
         format,
         ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP
@@ -354,7 +354,7 @@ mod tests {
     fn store() -> PathBuf {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("smash-images-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-images-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

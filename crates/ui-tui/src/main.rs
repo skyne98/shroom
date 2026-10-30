@@ -1,5 +1,5 @@
-//! Terminal client: translates crossterm keys into `smash_ui::chat::Key` and
-//! prints the rows `Chat::frame` lays out. All behaviour lives in smash-ui,
+//! Terminal client: translates crossterm keys into `shroom_ui::chat::Key` and
+//! prints the rows `Chat::frame` lays out. All behaviour lives in shroom-ui,
 //! shared with the gpui client.
 
 mod kitty;
@@ -17,10 +17,10 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
-use smash_ui::NIGHT;
-use smash_ui::chat::{Chat, Key, Mods, Outcome};
-use smash_ui::layout::{Paint, Row};
-use smash_ui::popup::Popup;
+use shroom_ui::NIGHT;
+use shroom_ui::chat::{Chat, Key, Mods, Outcome};
+use shroom_ui::layout::{Paint, Row};
+use shroom_ui::popup::Popup;
 
 const fn rgb(color: u32) -> Color {
     Color::Rgb((color >> 16) as u8, (color >> 8) as u8, color as u8)
@@ -150,7 +150,7 @@ fn copy(text: &str) -> std::io::Result<()> {
 
 fn main() -> std::io::Result<()> {
     if std::env::args().any(|arg| arg == "--version") {
-        println!("smash {}", env!("CARGO_PKG_VERSION"));
+        println!("shroom {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     let mut chat = Chat::open().with_startup_prompt();
@@ -204,7 +204,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, chat: &mut Chat) -> std::io::Res
             })?;
             if let Some(kitty) = pictures.as_mut() {
                 // A popup covers the transcript: pictures would draw over it.
-                let visible: &[smash_ui::chat::Shown] = if popup_open { &[] } else { &shown };
+                let visible: &[shroom_ui::chat::Shown] = if popup_open { &[] } else { &shown };
                 let cell = crossterm::terminal::window_size()
                     .ok()
                     .filter(|size| size.columns > 0 && size.rows > 0 && size.height > 0)
@@ -281,7 +281,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, chat: &mut Chat) -> std::io::Res
 /// Scrollbar as glyphs. Terminals have no hover here (the mouse isn't
 /// captured, so text selection keeps working), so it is always collapsed:
 /// just the thumb, no track.
-fn draw_bar(buf: &mut ratatui::buffer::Buffer, area: Rect, bar: &smash_ui::layout::Bar) {
+fn draw_bar(buf: &mut ratatui::buffer::Buffer, area: Rect, bar: &shroom_ui::layout::Bar) {
     for row in bar.thumb.clone() {
         let at = (area.x + bar.col as u16, area.y + row as u16);
         if let Some(cell) = buf.cell_mut(at) {

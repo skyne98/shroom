@@ -5,8 +5,8 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use smash_ai::{Message, Role};
-use smash_backend::{Agent, CancellationToken, Inbox, Update};
+use shroom_ai::{Message, Role};
+use shroom_backend::{Agent, CancellationToken, Inbox, Update};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn queued_and_late_messages_steer_the_run() {

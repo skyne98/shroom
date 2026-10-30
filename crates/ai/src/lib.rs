@@ -6,9 +6,9 @@
 //! usage and cost. Providers, SSE parsing and auth stay in genai.
 //!
 //! ```no_run
-//! # async fn run() -> Result<(), smash_ai::Error> {
+//! # async fn run() -> Result<(), shroom_ai::Error> {
 //! use futures_util::StreamExt;
-//! use smash_ai::{Client, Context, Event, Message, Model, Tool};
+//! use shroom_ai::{Client, Context, Event, Message, Model, Tool};
 //!
 //! let model = Model::anthropic("claude-sonnet-4-20250514");
 //! let mut ctx = Context::new().system("be brief");
@@ -116,8 +116,8 @@ impl Error {
         });
         let retry_after = err.headers().and_then(retry_after);
         let text = err.to_string();
-        if std::env::var_os("SMASH_AI_DEBUG").is_some() {
-            eprintln!("[smash-ai] provider error (status {status:?}): {text:?}");
+        if std::env::var_os("SHROOM_AI_DEBUG").is_some() {
+            eprintln!("[shroom-ai] provider error (status {status:?}): {text:?}");
         }
         let mut error = classify(status, &text);
         error.retry_after = retry_after;
@@ -715,13 +715,13 @@ impl Client {
     }
 }
 
-/// `SMASH_TRACE=<file>`: append every raw provider frame as JSON lines, so a
+/// `SHROOM_TRACE=<file>`: append every raw provider frame as JSON lines, so a
 /// garbled answer can be pinned on the wire (provider) or on us.
 struct Trace(std::sync::Mutex<std::fs::File>);
 
 impl Trace {
     fn from_env() -> Option<Self> {
-        let path = std::env::var_os("SMASH_TRACE")?;
+        let path = std::env::var_os("SHROOM_TRACE")?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -812,9 +812,9 @@ fn request(ctx: &Context, model: &Model) -> ChatRequest {
         messages.push(last.with_options(mark()));
     }
 
-    if std::env::var_os("SMASH_AI_DEBUG").is_some() {
+    if std::env::var_os("SHROOM_AI_DEBUG").is_some() {
         eprintln!(
-            "[smash-ai] request messages: {}",
+            "[shroom-ai] request messages: {}",
             serde_json::to_string(&messages).unwrap_or_default()
         );
     }
@@ -1101,7 +1101,7 @@ mod tests {
 
     #[test]
     fn images_go_out_labelled_and_numbered_across_the_conversation() {
-        let dir = std::env::temp_dir().join(format!("smash-req-img-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-req-img-{}", std::process::id()));
         let mut png = Vec::new();
         ::image::DynamicImage::ImageRgb8(::image::RgbImage::new(4, 3))
             .write_to(
@@ -1145,7 +1145,7 @@ mod tests {
 
     #[test]
     fn a_model_that_cannot_see_gets_metadata_every_time_the_same() {
-        let dir = std::env::temp_dir().join(format!("smash-req-blind-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shroom-req-blind-{}", std::process::id()));
         let mut png = Vec::new();
         ::image::DynamicImage::ImageRgb8(::image::RgbImage::new(4, 3))
             .write_to(
