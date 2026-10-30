@@ -43,16 +43,18 @@ pub struct Theme {
 }
 
 pub const NIGHT: Theme = Theme {
-    bg: 0x11121a,
-    surface: 0x262838,
-    text: 0xe6e6ea,
-    dim: 0x9b9da4,
+    // Neutral greys (no blue cast), as in zeron: content sits on near-black,
+    // surfaces are a lighter wash of the same grey.
+    bg: 0x0e0e0e,
+    surface: 0x1e1e1e,
+    text: 0xe5e5e5,
+    dim: 0xa3a3a3,
     accent: 0x7ec48c,
     code: 0xd6ba82,
-    faint: 0x5c6070,
-    muted: 0x8c8f9c,
+    faint: 0x525252,
+    muted: 0x8e8e8e,
     agent: 0xb48ef0,
-    select: 0x3b4766,
+    select: 0x2c2c2c,
     error: 0xf07882,
 };
 

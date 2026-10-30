@@ -386,6 +386,37 @@ pub fn transcript_rows(body: &[String], width: usize, copy: Option<&str>, fold: 
         if !laid.rows.is_empty() {
             laid.rows.push(Row::new());
         }
+        if parsed[index].role == Role::User && pixels() {
+            // The window: the prompt is a bubble on the right, as wide as
+            // its text (at most three quarters of the column).
+            let top = laid.rows.len();
+            let most = (width * 3 / 4).max(12);
+            let mut rows = Vec::new();
+            for text in parsed[index].text.split('\n') {
+                rows.extend(wrap(
+                    Row::new(),
+                    Row::new(),
+                    vec![run(text, BAND.sans())],
+                    most,
+                    None,
+                ));
+            }
+            let ink = |row: &Row| {
+                row.iter()
+                    .map(|run| text_width(&run.text, run.paint))
+                    .sum::<f32>()
+            };
+            let wide = (rows.iter().map(ink).fold(0.0, f32::max).ceil() as usize).clamp(1, most);
+            let pad = width.saturating_sub(wide + 1);
+            for mut row in rows {
+                row.insert(0, run(" ".repeat(pad), BAND));
+                laid.rows.push(row);
+            }
+            laid.panels
+                .push((top..laid.rows.len(), pad..pad + wide, Panel::Prompt));
+            index += 1;
+            continue;
+        }
         if parsed[index].role == Role::User {
             let top = laid.rows.len();
             for (line, text) in parsed[index].text.split('\n').enumerate() {
@@ -1496,6 +1527,25 @@ pub fn slice(row: &[Run], cols: Range<usize>) -> Row {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_draws_a_prompt_as_a_right_aligned_bubble() {
+        set_style(Style {
+            measure: Some(std::rc::Rc::new(|text: &str, _, _| {
+                text.chars().count() as f32
+            })),
+            prose: 40,
+        });
+        let body = vec![format!("{}short", crate::USER)];
+        let laid = transcript_rows(&body, 40, None, Fold::all());
+        set_style(Style::default());
+        let (rows, cols, kind) = laid.panels[0].clone();
+        assert_eq!(kind, Panel::Prompt);
+        assert_eq!(rows, 0..1);
+        assert_eq!(cols, 34..39, "as wide as its text, one cell from the edge");
+        let text: String = laid.rows[0].iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(text.trim(), "short");
+    }
 
     #[test]
     fn rows_never_exceed_width() {
