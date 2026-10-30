@@ -83,6 +83,122 @@ impl Spring {
     }
 }
 
+// ----------------------------------------------------------- zeron curves
+
+/// A CSS `cubic-bezier(x1, y1, x2, y2)` timing function, ported from zeron's
+/// motion kit: Newton iteration with a bisection fallback (UnitBezier).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CubicBezier {
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+}
+
+impl CubicBezier {
+    pub const fn new(x1: f64, y1: f64, x2: f64, y2: f64) -> Self {
+        Self { x1, y1, x2, y2 }
+    }
+
+    fn coefficients(a: f64, b: f64) -> (f64, f64, f64) {
+        let c = 3.0 * a;
+        let bb = 3.0 * (b - a) - c;
+        (1.0 - c - bb, bb, c)
+    }
+
+    fn sample(a: f64, b: f64, t: f64) -> f64 {
+        let (aa, bb, cc) = Self::coefficients(a, b);
+        ((aa * t + bb) * t + cc) * t
+    }
+
+    fn solve_t_for_x(&self, x: f64) -> f64 {
+        let (a, b, c) = Self::coefficients(self.x1, self.x2);
+        let mut t = x;
+        for _ in 0..8 {
+            let err = Self::sample(self.x1, self.x2, t) - x;
+            if err.abs() < 1e-9 {
+                return t;
+            }
+            let d = (3.0 * a * t + 2.0 * b) * t + c;
+            if d.abs() < 1e-9 {
+                break;
+            }
+            t -= err / d;
+        }
+        let (mut lo, mut hi) = (0.0, 1.0);
+        for _ in 0..48 {
+            let mid = (lo + hi) / 2.0;
+            if Self::sample(self.x1, self.x2, mid) < x {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (lo + hi) / 2.0
+    }
+
+    /// Eased output for progress `x` in 0..1 (clamped).
+    pub fn eval(&self, x: f64) -> f64 {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        if x >= 1.0 {
+            return 1.0;
+        }
+        Self::sample(self.y1, self.y2, self.solve_t_for_x(x)).clamp(0.0, 1.0)
+    }
+}
+
+/// zeron's entrance curve, `cubic-bezier(0.16, 1, 0.3, 1)`.
+pub const EASE_OUT_EXPO: CubicBezier = CubicBezier::new(0.16, 1.0, 0.3, 1.0);
+/// CSS `ease-out`: sizes.
+pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
+/// CSS `ease`: quick fades, menus, dialogs.
+pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
+/// Tailwind's default transition curve: hover fades.
+pub const EASE_TAILWIND: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);
+
+/// A timed eased transition (zeron's `MotionSpec`): a duration and a curve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ease {
+    pub ms: u64,
+    pub curve: CubicBezier,
+}
+
+impl Ease {
+    pub const fn new(ms: u64, curve: CubicBezier) -> Self {
+        Self { ms, curve }
+    }
+
+    fn secs(self) -> f64 {
+        self.ms as f64 / 1000.0
+    }
+
+    // zeron's catalog.
+    /// Entrances: rows, the welcome, a session switch.
+    pub const FADE_IN: Ease = Ease::new(500, EASE_OUT_EXPO);
+    /// Small things appearing (notices).
+    pub const FADE_QUICK: Ease = Ease::new(150, EASE);
+    /// Popovers opening.
+    pub const MENU_IN: Ease = Ease::new(140, EASE);
+    /// Popovers closing.
+    pub const MENU_OUT: Ease = Ease::new(100, EASE);
+    /// Dialogs opening and closing.
+    pub const DIALOG_IN: Ease = Ease::new(180, EASE);
+    /// Sizes and sliders (panes, the prompt box, the effort thumb).
+    pub const RESIZE: Ease = Ease::new(200, EASE_OUT);
+    /// Hover and highlight plates.
+    pub const HOVER_FADE: Ease = Ease::new(150, EASE_TAILWIND);
+}
+
+/// An eased transition in flight: from where it started, how far along.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Tween {
+    ease: Ease,
+    from: f64,
+    elapsed: f64,
+}
+
 /// Offset (in the value's units) and speed (units/s) below which a spring is
 /// at rest: a 200th of a row or of full opacity is invisible.
 const REST: f64 = 0.005;
@@ -98,6 +214,8 @@ pub struct Motion {
     pub velocity: f64,
     pub target: f64,
     pub spring: Spring,
+    /// Set: an eased transition (zeron's curves) instead of the spring.
+    tween: Option<Tween>,
 }
 
 impl Motion {
@@ -107,10 +225,23 @@ impl Motion {
             velocity: 0.0,
             target: value,
             spring,
+            tween: None,
         }
     }
 
     pub fn step(&mut self, dt: f64) {
+        if let Some(tween) = &mut self.tween {
+            tween.elapsed += dt;
+            let t = tween.elapsed / tween.ease.secs().max(1e-6);
+            if t >= 1.0 {
+                self.value = self.target;
+                self.velocity = 0.0;
+                self.tween = None;
+            } else {
+                self.value = tween.from + (self.target - tween.from) * tween.ease.curve.eval(t);
+            }
+            return;
+        }
         if self.resting() {
             self.value = self.target;
             self.velocity = 0.0;
@@ -128,6 +259,9 @@ impl Motion {
     }
 
     pub fn resting(&self) -> bool {
+        if self.tween.is_some() {
+            return false;
+        }
         (self.value - self.target).abs() < REST && self.velocity.abs() < REST_SPEED
     }
 }
@@ -159,6 +293,12 @@ pub enum Key {
     Bar(usize),
     /// The window's sidebar: 0 hidden, 1 shown.
     Sidebar,
+    /// The effort slider's thumb, 0..1 along the rail.
+    Effort,
+    /// The model and effort panel: 0 closed, 1 open.
+    EffortPanel,
+    /// A pointer-hover highlight (0 off, 1 on), by the client's id.
+    Hover(u64),
 }
 
 /// Every running motion. Protocol, once per frame: [`Motions::tick`] first,
@@ -236,8 +376,46 @@ impl Motions {
                 velocity: 0.0,
                 target: to,
                 spring,
+                tween: None,
             },
         );
+    }
+
+    /// Like [`follow`](Self::follow), on one of zeron's eased curves: a new
+    /// target starts a fresh transition from where the value is now, so it
+    /// never jumps.
+    pub fn ease(&mut self, key: Key, target: f64, ease: Ease) -> f64 {
+        let reduced = self.reduced;
+        let motion = self
+            .motions
+            .entry(key)
+            .or_insert_with(|| Motion::at(target, Spring::FADE));
+        if reduced {
+            *motion = Motion::at(target, Spring::FADE);
+        } else if motion.target != target {
+            motion.tween = Some(Tween {
+                ease,
+                from: motion.value,
+                elapsed: 0.0,
+            });
+            motion.target = target;
+            motion.velocity = 0.0;
+        }
+        motion.value
+    }
+
+    /// Start `key` at `from` easing to `to` (an entrance, zeron's curves).
+    pub fn enter(&mut self, key: Key, from: f64, to: f64, ease: Ease) {
+        let mut motion = Motion::at(to, Spring::FADE);
+        if !self.reduced {
+            motion.value = from;
+            motion.tween = Some(Tween {
+                ease,
+                from,
+                elapsed: 0.0,
+            });
+        }
+        self.motions.insert(key, motion);
     }
 
     /// Shift `key`'s current value by `by`, target unchanged: content that
@@ -394,6 +572,7 @@ mod tests {
                 velocity: -5.0,
                 target: 0.0,
                 spring,
+                tween: None,
             };
             let mut fine = coarse;
             coarse.step(0.03);
@@ -412,6 +591,7 @@ mod tests {
             velocity: 0.0,
             target: 1.0,
             spring,
+            tween: None,
         };
         let (mut t, mut peak, mut ninety) = (0.0, 0.0f64, None);
         while !motion.resting() {
@@ -452,6 +632,7 @@ mod tests {
             velocity: 0.0,
             target: 40.0,
             spring: Spring::GLIDE,
+            tween: None,
         };
         let mut last = motion.value;
         while !motion.resting() {

@@ -6738,6 +6738,7 @@ dependencies = [
  "gpui-base",
  "gpui_platform",
  "shroom-ui",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

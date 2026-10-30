@@ -36,10 +36,18 @@ const COLUMN: usize = 84;
 const SIDEBAR: f32 = 248.;
 const HEADER: f32 = 38.;
 const FOOTER: f32 = 28.;
-/// Composer card padding around its text rows.
-const COMPOSER_PAD: f32 = 12.;
-/// The composer's toolbar row (attach, model, thinking, send), at zoom 1.
-const TOOLBAR: f32 = 34.;
+/// The composer pill (zeron): attach on the left of the text, the model and
+/// effort chip and send on its right, all 32 px tall.
+const PILL_PAD: f32 = 8.;
+const PILL_BUTTON: f32 = 32.;
+/// Space left of the reading column for the attach button.
+const PILL_LEFT: f32 = PILL_PAD + PILL_BUTTON + 6.;
+/// The effort panel (zeron's compact picker).
+const PANEL_W: f32 = 256.;
+const SLIDER_H: f32 = 36.;
+const RAIL_H: f32 = 28.;
+const THUMB_W: f32 = 44.;
+const THUMB_H: f32 = 32.;
 /// The sidebar: a shade lighter than the content, as in zeron.
 const SHELL: u32 = 0x151515;
 /// Hairlines between regions (white at ~8%).
@@ -54,6 +62,7 @@ const ICON_NEW: &str = "\u{f067}";
 const ICON_ATTACH: &str = "\u{f0c6}";
 const ICON_SEND: &str = "\u{f062}";
 const ICON_STOP: &str = "\u{f04d}";
+const ICON_MODEL: &str = "\u{f2db}";
 
 struct Root {
     chat: Chat,
@@ -75,6 +84,14 @@ struct Root {
     hit_area: HitArea,
     /// Answering (the composer's button is stop).
     generating: bool,
+    /// Last frame's transcript rows as drawn, for mapping the pointer to a
+    /// cell in proportional text.
+    shown: Vec<Row>,
+    /// The effort slider's bounds last frame, and whether it is dragged.
+    slider: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    sliding: bool,
+    /// The model chip's text last frame (it sizes the room beside the prompt).
+    chip_label: String,
     /// Proportional glyph advances, at zoom 1 in cells, by (face, bold).
     advances: Advances,
     _tick: Task<()>,
@@ -229,6 +246,10 @@ impl Root {
             title: String::new(),
             sidebar: 1.,
             generating: false,
+            shown: Vec::new(),
+            slider: Default::default(),
+            sliding: false,
+            chip_label: String::new(),
             hit_area: HitArea::default(),
             advances: Default::default(),
             _tick: tick,
@@ -326,6 +347,37 @@ impl Root {
     /// Window position → grid cell of the last frame: transcript rows from
     /// the grid origin, prompt rows from the composer card's. None outside
     /// the chat (sidebar, header, footer).
+    /// The cell under `x` in a transcript row: prose is proportional, so
+    /// walk its glyphs with their drawn widths.
+    fn col_at(&self, row: usize, x: f32, window: &Window) -> Option<usize> {
+        let cells = self.shown.get(row)?;
+        let cell = f32::from(self.cell());
+        let measure = self.measure(window);
+        let target = x - self.origin.0;
+        let (mut px_at, mut col) = (0.0f32, 0usize);
+        for part in cells {
+            for ch in part.text.chars() {
+                let span = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                let drawn = if part.paint.face == Face::Mono {
+                    cell * span as f32
+                } else {
+                    measure(
+                        ch.encode_utf8(&mut [0; 4]),
+                        part.paint.face,
+                        part.paint.bold,
+                    ) * cell
+                        * self.zoom
+                };
+                if px_at + drawn / 2. > target {
+                    return Some(col);
+                }
+                px_at += drawn;
+                col += span;
+            }
+        }
+        Some(col + ((target - px_at) / cell).max(0.) as usize)
+    }
+
     fn cell_at(&self, x: Pixels, y: Pixels) -> Option<(usize, usize)> {
         let (x, y) = (f32::from(x), f32::from(y));
         let area = self.hit_area;
@@ -345,7 +397,25 @@ impl Root {
         Some((row, col))
     }
 
+    /// Pick the effort level under `x` on the slider.
+    fn slide_to(&mut self, x: Pixels, levels: usize) {
+        let Some(bounds) = self.slider.get() else {
+            return;
+        };
+        let inset = THUMB_W / 2. * self.zoom;
+        let run = (f32::from(bounds.size.width) - 2. * inset).max(1.);
+        let at = ((f32::from(x - bounds.origin.x) - inset) / run).clamp(0., 1.);
+        self.chat
+            .set_effort_at((at * levels.saturating_sub(1) as f32).round() as usize);
+    }
+
     fn on_click(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A click anywhere else closes the effort panel.
+        if self.chat.effort_panel_open() {
+            self.chat.close_effort_panel();
+            cx.notify();
+            return;
+        }
         // In the composer: the byte under the pointer in proportional text.
         if let Some((row, at)) = self.text_at(event.position.x, event.position.y, window) {
             self.chat
@@ -355,6 +425,12 @@ impl Root {
         }
         let Some((row, col)) = self.cell_at(event.position.x, event.position.y) else {
             return;
+        };
+        let col = if row < self.hit_area.above {
+            self.col_at(row, f32::from(event.position.x), window)
+                .unwrap_or(col)
+        } else {
+            col
         };
         let mods = Mods {
             ctrl: event.modifiers.control,
@@ -370,10 +446,24 @@ impl Root {
         if event.pressed_button != Some(MouseButton::Left) {
             return;
         }
+        if self.sliding {
+            let levels = self.chat.effort_level_count();
+            self.slide_to(event.position.x, levels);
+            cx.notify();
+            return;
+        }
         let changed = match self.text_at(event.position.x, event.position.y, window) {
             Some((row, at)) => self.chat.drag_text(row, at),
             None => match self.cell_at(event.position.x, event.position.y) {
-                Some((row, col)) => self.chat.drag(row, col),
+                Some((row, col)) => {
+                    let col = if row < self.hit_area.above {
+                        self.col_at(row, f32::from(event.position.x), window)
+                            .unwrap_or(col)
+                    } else {
+                        col
+                    };
+                    self.chat.drag(row, col)
+                }
                 None => false,
             },
         };
@@ -411,6 +501,10 @@ impl Root {
     /// Selecting text puts it on the primary selection (middle-click paste),
     /// like every Linux app.
     fn on_release(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.sliding) {
+            cx.notify();
+            return;
+        }
         if let Some(text) = self.chat.release() {
             cx.write_to_primary(ClipboardItem::new_string(text));
         }
@@ -1491,9 +1585,17 @@ impl Render for Root {
         let columns = ((main_w - 2. * m.pad) / f32::from(m.cell)).max(10.);
         // Header and footer are chrome; the rest is the chat's grid (the
         // composer card adds its padding around the input rows).
-        let chrome_h = (HEADER + FOOTER + TOOLBAR) * z + 2. * COMPOSER_PAD * z;
+        let chrome_h = (HEADER + FOOTER + PILL_BUTTON + 2. * PILL_PAD + 6.) * z;
+        // Room beside the prompt text for the chip and send (last frame's
+        // chip text; it changes rarely).
+        let measure = self.measure(window);
+        let chip_cells = measure(&self.chip_label, Face::Sans, false) * 12.5 / SANS_SIZE;
+        let room_px = (20. + 6. + PILL_BUTTON + 8. + PILL_PAD + 8.) * z;
+        self.chat
+            .set_input_room((chip_cells + room_px / f32::from(m.cell)).ceil() as usize + 1);
         let rows = ((f32::from(viewport.height) - chrome_h - m.pad) / m.line).max(4.);
         let frame = self.chat.frame(columns as usize, rows as usize);
+        self.shown = frame.rows[..frame.viewport.min(frame.rows.len())].to_vec();
         let chrome = frame.chrome.clone();
         if let Some(chrome) = &chrome {
             self.sidebar = chrome.sidebar;
@@ -1528,7 +1630,7 @@ impl Render for Root {
                     + (above + frame.dock.len()) as f32 * m.line
                     + 6. * z
                     + 1.
-                    + COMPOSER_PAD * z * 0.75
+                    + (PILL_PAD + (PILL_BUTTON - LINE_HEIGHT) / 2.) * z
                     + chip_rows as f32 * m.line,
             ),
             first_input,
@@ -1545,7 +1647,20 @@ impl Render for Root {
                 .unwrap_or_default();
             popup(view, hints, m, cx).into_any_element()
         });
-        let body = chat_body(frame, chrome.clone(), m, columns as usize, cx);
+        if let Some(chrome) = &chrome {
+            self.chip_label = chip_label(chrome);
+        }
+        let chat = &self.chat;
+        let hover = |key: &str| chat.hovered(hover_id(key));
+        let body = chat_body(
+            frame,
+            chrome.clone(),
+            m,
+            columns as usize,
+            &hover,
+            self.slider.clone(),
+            cx,
+        );
         let side = (sidebar_w > 1.)
             .then(|| {
                 chrome
@@ -1601,6 +1716,8 @@ fn chat_body(
     chrome: Option<Chrome>,
     m: Metrics,
     window_cols: usize,
+    hover: &dyn Fn(&str) -> f32,
+    slider: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     cx: &mut Context<Root>,
 ) -> gpui::AnyElement {
     let z = m.zoom;
@@ -1703,19 +1820,21 @@ fn chat_body(
     let generating = chrome.as_ref().is_some_and(|chrome| chrome.generating);
     let can_send = chrome.as_ref().is_some_and(|chrome| chrome.can_send);
     let root = cx.entity();
+    let attach_hover = hover("attach");
     let attach = gpui_base::Button::new("attach")
         .aria_label("Attach files")
         .flex_none()
-        .size(px(28. * z))
-        .rounded(px(14. * z))
+        .size(px(PILL_BUTTON * z))
+        .rounded_full()
         .flex()
         .items_center()
         .justify_center()
         .font_family(FONT)
-        .text_size(px(14. * z))
-        .text_color(color(NIGHT.muted))
+        .text_size(px(15. * z))
+        .bg(ink(0.06 * attach_hover))
+        .text_color(mix(NIGHT.muted, NIGHT.text, attach_hover))
         .cursor_pointer()
-        .hover(|style| style.bg(color(HOVER)).text_color(color(NIGHT.text)))
+        .on_hover(hover_listener("attach", cx))
         .on_click(move |_, _, cx| {
             let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
                 files: true,
@@ -1739,74 +1858,104 @@ fn chat_body(
             .detach();
         })
         .child(ICON_ATTACH);
-    let ghost = |id: &'static str, label: String, keys: &'static str, cx: &mut Context<Root>| {
+    // The model and effort chip (zeron): opens the effort panel, or the model
+    // list when the model has no levels.
+    let chip = chrome.as_ref().map(|chrome| {
+        let t = hover("model-chip");
+        let open = chrome.effort.as_ref().is_some_and(|panel| panel.open > 0.5);
+        let has_levels = chrome.effort.is_some();
+        let level = chrome
+            .effort
+            .as_ref()
+            .and_then(|panel| panel.levels.get(panel.selected).cloned());
         let root = cx.entity();
-        gpui_base::Button::new(id)
-            .aria_label(SharedString::from(label.clone()))
+        gpui_base::Button::new("model-chip")
+            .aria_label(SharedString::from(format!("Model {}", chip_label(chrome))))
             .flex_none()
-            .h(px(28. * z))
-            .px(px(8. * z))
-            .rounded(px(7. * z))
+            .h(px(PILL_BUTTON * z))
+            .px(px(10. * z))
+            .rounded(px(10. * z))
+            .bg(ink(if open { 0.08 } else { 0.05 + 0.04 * t }))
             .flex()
             .items_center()
+            .gap(px(6. * z))
             .text_size(px(12.5 * z))
-            .text_color(color(NIGHT.dim))
             .cursor_pointer()
-            .hover(|style| style.bg(color(HOVER)).text_color(color(NIGHT.text)))
+            .on_hover(hover_listener("model-chip", cx))
             .on_click(move |_, _, cx| {
                 root.update(cx, |root, cx| {
-                    let outcome = root.chat.press(keys);
-                    root.apply(outcome, cx);
+                    if has_levels {
+                        root.chat.toggle_effort_panel();
+                    } else {
+                        let outcome = root.chat.press("ctrl+l model");
+                        root.apply(outcome, cx);
+                    }
                     cx.notify();
                 });
             })
-            .child(SharedString::from(label))
-    };
-    let model = chrome
+            .child(
+                div()
+                    .font_family(FONT)
+                    .text_size(px(12. * z))
+                    .text_color(color(NIGHT.muted))
+                    .child(ICON_MODEL),
+            )
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(color(NIGHT.text))
+                    .child(SharedString::from(chrome.model.clone())),
+            )
+            .children(level.map(|level| {
+                div()
+                    .text_color(color(NIGHT.muted))
+                    .child(SharedString::from(level))
+            }))
+    });
+    let panel = chrome
         .as_ref()
-        .map(|chrome| ghost("composer-model", chrome.model.clone(), "ctrl+l model", cx));
-    let thinking = chrome
-        .as_ref()
-        .and_then(|chrome| chrome.thinking.clone())
-        .map(|label| ghost("composer-thinking", label, "shift+tab thinking", cx));
-    let toolbar = div()
-        .h(px((TOOLBAR - 6.) * z))
-        .flex()
-        .items_center()
-        .gap(px(2. * z))
-        .child(attach)
-        .child(div().flex_1())
-        .children(model)
-        .children(thinking)
-        .child(div().w(px(4. * z)))
-        .child(send_button(generating, can_send, m, cx));
+        .and_then(|chrome| {
+            chrome
+                .effort
+                .clone()
+                .map(|panel| (chrome.model.clone(), panel))
+        })
+        .filter(|(_, panel)| panel.open > 0.01)
+        .map(|(model, panel)| {
+            effort_panel(model, panel, m, hover, slider.clone(), cx).into_any_element()
+        });
     let composer_card = div()
         .id("composer")
         .role(gpui::Role::MultilineTextInput)
         .aria_label("Message")
-        .ml(column_left - px(COMPOSER_PAD * z))
-        .w(column_w + px(2. * COMPOSER_PAD * z))
+        .relative()
+        .ml(column_left - px(PILL_LEFT * z))
+        .w(column_w + px((PILL_LEFT + PILL_PAD) * z))
         .mt(px(6. * z))
-        .px(px(COMPOSER_PAD * z))
-        .pt(px(COMPOSER_PAD * z * 0.75))
-        .pb(px(6. * z))
-        .rounded(px(18. * z))
+        .p(px(PILL_PAD * z))
+        .rounded(px(26. * z))
         .bg(color(0x171717))
         .border_1()
         .border_color(color(LINE))
         .shadow_md()
         .flex()
-        .flex_col()
+        .items_end()
         .gap(px(6. * z))
+        .child(attach)
         .child(
             div()
+                .flex_1()
                 .min_w(px(0.))
+                .py(px((PILL_BUTTON - LINE_HEIGHT) / 2. * z))
                 .flex()
                 .flex_col()
                 .children(chip_rows)
                 .children(input_rows),
         )
-        .child(toolbar);
+        .children(chip)
+        .child(div().w(px(2. * z)))
+        .child(send_button(generating, can_send, m, cx))
+        .children(panel);
     // Under the composer: a notice on the left, the context ring on the right.
     let notice = chrome
         .as_ref()
@@ -1888,7 +2037,7 @@ fn send_button(
         .aria_keyshortcuts(if generating { "Escape" } else { "Enter" })
         .disabled(!live)
         .flex_none()
-        .size(px(28. * z))
+        .size(px(PILL_BUTTON * z))
         .rounded_full()
         .bg(color(if live { NIGHT.text } else { 0x2a2a2a }))
         .flex()
@@ -1910,6 +2059,233 @@ fn send_button(
             });
         })
         .child(glyph)
+}
+
+/// A stable id for a hover target.
+fn hover_id(key: &str) -> u64 {
+    key.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// Pointer in/out of `key`: its highlight fades (Chat runs the spring).
+fn hover_listener(
+    key: &'static str,
+    cx: &mut Context<Root>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+    let root = cx.entity();
+    move |on: &bool, _, cx| {
+        let on = *on;
+        root.update(cx, |root, cx| {
+            root.chat.hover(hover_id(key), on);
+            cx.notify();
+        });
+    }
+}
+
+/// White ink at `alpha` (hover and chip plates, as zeron's `ink`).
+fn ink(alpha: f32) -> Hsla {
+    hsla(0., 0., 1., alpha.clamp(0., 1.))
+}
+
+fn mix(from: u32, to: u32, t: f32) -> Hsla {
+    color(shroom_ui::motion::mix(from, to, f64::from(t.clamp(0., 1.))))
+}
+
+/// The chip's text: the model and its effort level.
+fn chip_label(chrome: &Chrome) -> String {
+    match chrome
+        .effort
+        .as_ref()
+        .and_then(|panel| panel.levels.get(panel.selected))
+    {
+        Some(level) => format!("{}  {level}", chrome.model),
+        None => chrome.model.clone(),
+    }
+}
+
+/// The model and effort panel (zeron's compact picker), above the chip:
+/// the level and model as a link to the model list, then a slider over the
+/// model's levels. It pops open and folds away; the thumb glides.
+fn effort_panel(
+    model: String,
+    panel: shroom_ui::chat::EffortPanel,
+    m: Metrics,
+    hover: &dyn Fn(&str) -> f32,
+    slider: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    cx: &mut Context<Root>,
+) -> impl IntoElement {
+    let z = m.zoom;
+    let open = panel.open.clamp(0., 1.2);
+    let level = panel
+        .levels
+        .get(panel.selected)
+        .cloned()
+        .unwrap_or_default();
+    let count = panel.levels.len();
+    let link = hover("effort-model");
+    let root = cx.entity();
+    let title = gpui_base::Button::new("effort-model")
+        .aria_label(SharedString::from(format!(
+            "{level} · {model} · Change model"
+        )))
+        .h(px(48. * z))
+        .px(px(8. * z))
+        .rounded(px(7. * z))
+        .bg(ink(0.05 * link))
+        .flex()
+        .items_center()
+        .gap(px(10. * z))
+        .cursor_pointer()
+        .on_hover(hover_listener("effort-model", cx))
+        .on_click(move |_, _, cx| {
+            root.update(cx, |root, cx| {
+                root.chat.close_effort_panel();
+                let outcome = root.chat.press("ctrl+l model");
+                root.apply(outcome, cx);
+                cx.notify();
+            });
+        })
+        .child(
+            div()
+                .font_family(FONT)
+                .text_size(px(13. * z))
+                .text_color(color(NIGHT.muted))
+                .child(ICON_MODEL),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_size(px(14. * z))
+                        .line_height(px(17. * z))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(color(NIGHT.text))
+                        .child(SharedString::from(level.clone())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(3. * z + 3. * z * link))
+                        .text_size(px(12. * z))
+                        .line_height(px(16. * z))
+                        .text_color(mix(NIGHT.muted, NIGHT.text, link))
+                        .child(SharedString::from(model))
+                        .child(
+                            div()
+                                .font_family(FONT)
+                                .text_size(px(10. * z))
+                                .child("\u{f105}"),
+                        ),
+                ),
+        );
+    let thumb = panel.thumb;
+    let accent = color(NIGHT.accent);
+    let rail = canvas(
+        move |bounds, _, _| slider.set(Some(bounds)),
+        move |bounds, (), window, _| {
+            let width = f32::from(bounds.size.width);
+            let inset = THUMB_W / 2. * z;
+            let run = (width - 2. * inset).max(0.);
+            let centre = inset + thumb * run;
+            let top = (SLIDER_H - RAIL_H) / 2. * z;
+            let rect = |x: f32, y: f32, w: f32, h: f32| Bounds {
+                origin: bounds.origin + gpui::point(px(x), px(y)),
+                size: size(px(w), px(h)),
+            };
+            window.paint_quad(gpui::quad(
+                rect(0., top, width, RAIL_H * z),
+                px(RAIL_H / 2. * z),
+                ink(0.06),
+                px(1.),
+                ink(0.08),
+                Default::default(),
+            ));
+            window.paint_quad(
+                gpui::fill(
+                    rect(0., top, (centre + RAIL_H / 2. * z).min(width), RAIL_H * z),
+                    accent.opacity(0.85),
+                )
+                .corner_radii(px(RAIL_H / 2. * z)),
+            );
+            for stop in 0..count {
+                let at = if count > 1 {
+                    stop as f32 / (count - 1) as f32
+                } else {
+                    0.
+                };
+                let x = inset + at * run;
+                let tone = if at <= thumb + 1e-3 {
+                    ink(0.4)
+                } else {
+                    hsla(0., 0., 0.6, 0.28)
+                };
+                window.paint_quad(
+                    gpui::fill(
+                        rect(x - 2. * z, SLIDER_H / 2. * z - 2. * z, 4. * z, 4. * z),
+                        tone,
+                    )
+                    .corner_radii(px(2. * z)),
+                );
+            }
+            let thumb_box = rect(
+                centre - THUMB_W / 2. * z,
+                (SLIDER_H - THUMB_H) / 2. * z,
+                THUMB_W * z,
+                THUMB_H * z,
+            );
+            window.paint_quad(
+                gpui::fill(thumb_box, hsla(0., 0., 0.96, 1.)).corner_radii(px(THUMB_H / 2. * z)),
+            );
+        },
+    )
+    .size_full();
+    let slide = div()
+        .id("effort-slider")
+        .role(gpui::Role::Slider)
+        .aria_label("Reasoning effort")
+        .aria_value(SharedString::from(level))
+        .mx(px(8. * z))
+        .mt(px(2. * z))
+        .mb(px(4. * z))
+        .h(px(SLIDER_H * z))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |root, event: &MouseDownEvent, _, cx| {
+                root.sliding = true;
+                root.slide_to(event.position.x, count);
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+        .child(rail);
+    // menu-in: rises 6 px and fades in as it pops open (spring overshoot
+    // reads as zeron's scale).
+    div()
+        .id("effort-panel")
+        .role(gpui::Role::Dialog)
+        .aria_label("Model and effort")
+        .absolute()
+        .right(px((PILL_PAD + PILL_BUTTON + 6.) * z))
+        .bottom(px((PILL_BUTTON + 2. * PILL_PAD + 8. - 6. * (1. - open)) * z))
+        .w(px(PANEL_W * z))
+        .opacity(open.min(1.))
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .p(px(4. * z))
+        .rounded(px(12. * z))
+        .bg(color(0x1a1a1a))
+        .border_1()
+        .border_color(color(0x2a2a2a))
+        .shadow_lg()
+        .flex()
+        .flex_col()
+        .child(title)
+        .child(slide)
 }
 
 fn main() {

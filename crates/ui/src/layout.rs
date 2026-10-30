@@ -1090,6 +1090,40 @@ fn is_bar(span: &markdown::Span) -> bool {
     span.ink == Ink::Dim && span.text == "│ "
 }
 
+/// One markdown span as a run: monospace in aligned blocks, list markers in
+/// the accent, and frameless tables in the window.
+fn styled_span(block: &markdown::Block, span: &markdown::Span, at: usize, bullet: usize) -> Run {
+    let mut paint = ink(span.ink);
+    if block.mono {
+        paint.face = Face::Mono;
+    }
+    // List numbers and bullets in the accent, like zeron.
+    if at == 0 && bullet > 0 {
+        paint = ACCENT;
+    }
+    // The window's tables are frameless: no column bars, the header rule a
+    // faint hairline.
+    if pixels() && block.mono && span.ink == Ink::Dim {
+        if span.text == " │ " {
+            return run("   ", paint);
+        }
+        if span.text.chars().all(|c| matches!(c, '─' | '┼')) {
+            return run(span.text.replace('┼', "─"), Paint::fg(NIGHT.faint));
+        }
+    }
+    run(span.text.clone(), paint)
+}
+
+/// Byte length of a leading `1. ` in a top-level bold paragraph.
+fn numbered_lead(block: &markdown::Block) -> Option<usize> {
+    let first = block.spans.first()?;
+    if block.indent != 0 || block.mono || first.ink != Ink::Bold {
+        return None;
+    }
+    let digits = first.text.bytes().take_while(u8::is_ascii_digit).count();
+    (digits > 0 && first.text[digits..].starts_with(". ")).then_some(digits + 2)
+}
+
 /// One assistant answer: `● ` marker on the first row, markdown blocks below.
 pub fn answer_rows(text: &str, width: usize, copy: Option<&str>) -> Laid {
     // Prose keeps a reading measure; code, tables and rules use the width.
@@ -1188,30 +1222,25 @@ pub fn answer_rows(text: &str, width: usize, copy: Option<&str>) -> Laid {
             hang.extend(quote);
             hang
         };
+        // `**1. Title** text`: a numbered heading written as bold text gets
+        // its number in the accent too, like a real list's.
+        let numbered = numbered_lead(block);
         let body = block
             .spans
             .iter()
             .enumerate()
-            .map(|(at, span)| {
-                let mut paint = ink(span.ink);
-                if block.mono {
-                    paint.face = Face::Mono;
+            .flat_map(|(at, span)| {
+                if at == 0
+                    && let Some(cut) = numbered
+                {
+                    let mut number = ACCENT;
+                    number.face = Face::Sans;
+                    return vec![
+                        run(span.text[..cut].to_string(), number),
+                        run(span.text[cut..].to_string(), ink(span.ink)),
+                    ];
                 }
-                // List numbers and bullets in the accent, like zeron.
-                if at == 0 && bullet > 0 {
-                    paint = ACCENT;
-                }
-                // The window's tables are frameless: no column bars, the
-                // header rule a faint hairline.
-                if pixels() && block.mono && span.ink == Ink::Dim {
-                    if span.text == " │ " {
-                        return run("   ", paint);
-                    }
-                    if span.text.chars().all(|c| matches!(c, '─' | '┼')) {
-                        return run(span.text.replace('┼', "─"), Paint::fg(NIGHT.faint));
-                    }
-                }
-                run(span.text.clone(), paint)
+                vec![styled_span(block, span, at, bullet)]
             })
             .collect();
         let first = vec![marker, run(" ".repeat(indent), TEXT)];
@@ -1575,6 +1604,17 @@ pub fn scroll_top_at(total: usize, rows: usize, row: usize) -> usize {
 }
 
 /// The cells of `row` in columns `cols`, styles kept.
+/// `row` with the cells in `cols` on background `bg` (selected text).
+pub fn highlight(row: &[Run], cols: Range<usize>, bg: u32) -> Row {
+    let mut out = slice(row, 0..cols.start);
+    out.extend(slice(row, cols.clone()).into_iter().map(|mut part| {
+        part.paint.bg = Some(bg);
+        part
+    }));
+    out.extend(slice(row, cols.end..usize::MAX));
+    out
+}
+
 pub fn slice(row: &[Run], cols: Range<usize>) -> Row {
     let mut out = Row::new();
     let mut col = 0;

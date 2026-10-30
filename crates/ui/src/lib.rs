@@ -54,7 +54,8 @@ pub const NIGHT: Theme = Theme {
     faint: 0x525252,
     muted: 0x8e8e8e,
     agent: 0xb48ef0,
-    select: 0x2c2c2c,
+    // The accent at ~35% over the background, as zeron's selection.
+    select: 0x2f4a36,
     error: 0xf07882,
 };
 

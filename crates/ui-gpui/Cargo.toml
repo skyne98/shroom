@@ -13,3 +13,4 @@ shroom-ui = { workspace = true }
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
 gpui-base = { workspace = true }
+unicode-width = "0.2"

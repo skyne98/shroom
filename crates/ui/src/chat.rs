@@ -26,7 +26,7 @@ use shroom_core::DocId;
 
 use crate::editor::Editor;
 use crate::layout::{self, ACCENT, DIM, Laid, Paint, Row, TEXT, run};
-use crate::motion::{self, Key as Anim, Motions, Spring};
+use crate::motion::{self, Ease, Key as Anim, Motions, Spring};
 use crate::popup::{self, Popup};
 use crate::{Clock, Item, Mode, NIGHT, Picker, hints, spinner_word};
 
@@ -179,6 +179,21 @@ pub struct Chrome {
     pub generating: bool,
     /// Something to send (the send button is live).
     pub can_send: bool,
+    /// The model and its effort ladder (None: the model has no levels).
+    pub effort: Option<EffortPanel>,
+}
+
+/// The window's model and effort panel (zeron's compact picker): a slider
+/// over the model's effort levels and a link to the model list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffortPanel {
+    /// `High`, `Max`, … (capitalised).
+    pub levels: Vec<String>,
+    pub selected: usize,
+    /// The thumb, 0..1 along the rail, gliding to `selected`.
+    pub thumb: f32,
+    /// 0 closed, 1 open (pops open, folds away).
+    pub open: f32,
 }
 
 /// One picture on screen.
@@ -1316,6 +1331,21 @@ pub struct Chat {
     input_map: Vec<InputSpot>,
     /// A drag that started in the prompt is selecting text.
     dragging: bool,
+    /// Selected transcript text: (anchor, head) as (content row, cell).
+    picked: Option<((usize, usize), (usize, usize))>,
+    /// The mouse is selecting transcript text.
+    picking: bool,
+    /// The model and effort panel is open.
+    effort_open: bool,
+    /// Cells the window keeps beside the prompt text (its buttons).
+    input_room: usize,
+    /// Pointer-hover targets by the client's element id; the highlights
+    /// fade toward them in `frame_at`.
+    hover_targets: HashMap<u64, bool>,
+    /// Last frame's transcript: first content row shown, top padding rows,
+    /// and the rows below the stored ones (the answer in flight).
+    shown_from: (usize, usize),
+    tail_rows: Vec<Row>,
     /// A model call failed transiently: (what, when the retry starts).
     retrying: Option<(String, std::time::Instant)>,
     /// The last failed run, kept so Enter on an empty box continues it.
@@ -1416,6 +1446,13 @@ impl Chat {
             hits: Vec::new(),
             input_map: Vec::new(),
             dragging: false,
+            picked: None,
+            picking: false,
+            effort_open: false,
+            input_room: 0,
+            hover_targets: HashMap::new(),
+            shown_from: (0, 0),
+            tail_rows: Vec::new(),
             retrying: None,
             failed: None,
             scrubbing: false,
@@ -1434,6 +1471,7 @@ impl Chat {
             Ok("models") => self.open_models(),
             Ok("sessions") => self.open_picker(),
             Ok("commands") => self.open_palette(),
+            Ok("effort") => self.toggle_effort_panel(),
             _ => {}
         }
         if let Ok(prompt) = std::env::var("SHROOM_PROMPT")
@@ -1554,6 +1592,73 @@ impl Chat {
     /// The pointer entered (`true`) or left a scrollbar (`Bar::id`): it
     /// expands while hovered, and collapses to a thin thumb otherwise.
     /// True when that changes anything (redraw).
+    /// The effort levels the model offers (all five when it is unknown).
+    fn effort_levels(&self) -> Vec<Effort> {
+        match self.entry() {
+            Some(entry) => entry.efforts.clone(),
+            None => vec![
+                Effort::Off,
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::Max,
+            ],
+        }
+    }
+
+    /// Open or close the model and effort panel.
+    pub fn toggle_effort_panel(&mut self) {
+        self.effort_open = !self.effort_open && !self.effort_levels().is_empty();
+    }
+
+    pub fn effort_level_count(&self) -> usize {
+        self.effort_levels().len()
+    }
+
+    pub fn effort_panel_open(&self) -> bool {
+        self.effort_open
+    }
+
+    pub fn close_effort_panel(&mut self) {
+        self.effort_open = false;
+    }
+
+    /// Pick effort level `index` of the model's ladder.
+    pub fn set_effort_at(&mut self, index: usize) {
+        let levels = self.effort_levels();
+        if let Some(effort) = levels.get(index.min(levels.len().saturating_sub(1)))
+            && self.effort() != Some(*effort)
+        {
+            self.settings.effort = Some(*effort);
+            self.settings.save(&self.settings_path);
+        }
+    }
+
+    /// Step the effort one level left (-1) or right (+1).
+    fn step_effort(&mut self, by: isize) {
+        let levels = self.effort_levels();
+        let at = self
+            .effort()
+            .and_then(|effort| levels.iter().position(|level| *level == effort))
+            .unwrap_or(0);
+        self.set_effort_at(at.saturating_add_signed(by));
+    }
+
+    /// The pointer entered (or left) element `id`; its highlight fades.
+    pub fn hover(&mut self, id: u64, on: bool) {
+        self.hover_targets.insert(id, on);
+    }
+
+    /// How highlighted element `id` is now, 0..1.
+    pub fn hovered(&self, id: u64) -> f32 {
+        self.motions.value(&Anim::Hover(id)).unwrap_or(0.0) as f32
+    }
+
+    /// Cells beside the prompt text kept for the window's buttons.
+    pub fn set_input_room(&mut self, cells: usize) {
+        self.input_room = cells;
+    }
+
     pub fn hover_bar(&mut self, id: usize, on: bool) -> bool {
         match self.bars_hovered.get_mut(id) {
             Some(hovered) if *hovered != on => {
@@ -1569,7 +1674,9 @@ impl Chat {
     fn open_bar(&mut self, mut bar: layout::Bar) -> layout::Bar {
         let dragged = bar.id == layout::TRANSCRIPT_BAR && self.scrubbing;
         let target = f64::from(u8::from(self.bars_hovered[bar.id] || dragged));
-        let open = self.motions.follow(Anim::Bar(bar.id), target, Spring::FADE);
+        let open = self
+            .motions
+            .ease(Anim::Bar(bar.id), target, Ease::HOVER_FADE);
         bar.open = (open.clamp(0.0, 1.0) * 1000.0).round() as u16;
         bar
     }
@@ -1609,7 +1716,100 @@ impl Chat {
 
     /// Selected prompt text, for the primary selection on Linux.
     pub fn selected_text(&self) -> Option<String> {
-        self.editor.selected().map(String::from)
+        self.editor
+            .selected()
+            .map(String::from)
+            .or_else(|| self.picked_text())
+    }
+
+    /// Content rows of the transcript: the stored layout, then the tail.
+    fn content_row(&self, index: usize) -> Option<Row> {
+        let stored = self
+            .cache
+            .as_ref()
+            .map_or(&[][..], |cache| &cache.laid.rows[..]);
+        match stored.get(index) {
+            Some(row) => Some(row.clone()),
+            None => {
+                let gap = usize::from(!stored.is_empty() && !self.tail_rows.is_empty());
+                index
+                    .checked_sub(stored.len() + gap)
+                    .and_then(|at| self.tail_rows.get(at).cloned())
+                    .or_else(|| (gap == 1 && index == stored.len()).then(Row::new))
+            }
+        }
+    }
+
+    /// The selection in reading order, None when empty.
+    fn picked_span(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (a, b) = self.picked?;
+        let (from, to) = if a <= b { (a, b) } else { (b, a) };
+        (from != to).then_some((from, to))
+    }
+
+    /// Selected transcript text, one line per row, without trailing blanks.
+    fn picked_text(&self) -> Option<String> {
+        let ((r0, c0), (r1, c1)) = self.picked_span()?;
+        let lines: Vec<String> = (r0..=r1)
+            .map(|index| {
+                let row = self.content_row(index).unwrap_or_default();
+                let from = if index == r0 { c0 } else { 0 };
+                let to = if index == r1 { c1 } else { usize::MAX };
+                let text: String = layout::slice(&row, from..to)
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect();
+                text.trim_end().to_string()
+            })
+            .collect();
+        // Drop the layout's left gutter (the answer marker and indent).
+        let gutter = lines
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.chars().take_while(|c| *c == ' ' || *c == '●').count())
+            .min()
+            .unwrap_or(0);
+        let text = lines
+            .iter()
+            .map(|line| line.chars().skip(gutter).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = text.trim_matches('\n').to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Content row under a transcript screen row.
+    fn content_at(&self, row: usize) -> usize {
+        let (start, pad) = self.shown_from;
+        start + row.saturating_sub(pad)
+    }
+
+    /// Cells of the word around `col` in a content row.
+    fn word_at(&self, index: usize, col: usize) -> (usize, usize) {
+        let row = self.content_row(index).unwrap_or_default();
+        let mut cells: Vec<(usize, char)> = Vec::new();
+        let mut at = 0;
+        for c in row.iter().flat_map(|run| run.text.chars()) {
+            cells.push((at, c));
+            at += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        }
+        let word = |c: char| c.is_alphanumeric() || c == '_';
+        let Some(here) = cells.iter().rposition(|(start, _)| *start <= col) else {
+            return (col, col);
+        };
+        if !word(cells[here].1) {
+            return (cells[here].0, cells[here].0 + 1);
+        }
+        let mut first = here;
+        while first > 0 && word(cells[first - 1].1) {
+            first -= 1;
+        }
+        let mut last = here;
+        while last + 1 < cells.len() && word(cells[last + 1].1) {
+            last += 1;
+        }
+        let end = cells.get(last + 1).map_or(at, |(start, _)| *start);
+        (cells[first].0, end)
     }
 
     /// Positive = older content. Wheel and trackpad land here.
@@ -1687,7 +1887,25 @@ impl Chat {
                 self.cache = None;
                 return Outcome::Redraw;
             }
+            None if self.mode == Mode::Chat && row < self.viewport => {
+                let index = self.content_at(row);
+                self.picked = Some(match count {
+                    1 if mods.shift => match self.picked {
+                        Some((anchor, _)) => (anchor, (index, col)),
+                        None => ((index, col), (index, col)),
+                    },
+                    1 => ((index, col), (index, col)),
+                    2 => {
+                        let (a, b) = self.word_at(index, col);
+                        ((index, a), (index, b))
+                    }
+                    _ => ((index, 0), (index, usize::MAX / 2)),
+                });
+                self.picking = true;
+                return Outcome::Redraw;
+            }
             Some(Hit::Input(spot)) => {
+                self.picked = None;
                 let at = self.offset(spot, col);
                 match count {
                     1 => self.editor.move_to(at, mods.shift),
@@ -1732,6 +1950,15 @@ impl Chat {
             self.scrub(row.min(self.viewport.saturating_sub(1)));
             return before != self.scroll;
         }
+        if self.picking {
+            let row = row.min(self.viewport.saturating_sub(1));
+            let head = (self.content_at(row), col);
+            let before = self.picked;
+            if let Some((anchor, _)) = self.picked {
+                self.picked = Some((anchor, head));
+            }
+            return before != self.picked;
+        }
         let (Some(first), Some(last)) = (self.input_map.first(), self.input_map.last()) else {
             return false;
         };
@@ -1749,6 +1976,9 @@ impl Chat {
     /// Button released. Returns the selection, for the primary clipboard.
     pub fn release(&mut self) -> Option<String> {
         self.scrubbing = false;
+        if std::mem::take(&mut self.picking) {
+            return self.picked_text();
+        }
         std::mem::take(&mut self.dragging)
             .then(|| self.selected_text())
             .flatten()
@@ -2293,6 +2523,24 @@ impl Chat {
 
     pub fn key(&mut self, key: Key, mods: Mods) -> Outcome {
         self.notice = None;
+        // The effort panel takes ←/→ and closes on Esc or Enter.
+        if self.effort_open {
+            match key {
+                Key::Left => {
+                    self.step_effort(-1);
+                    return Outcome::Redraw;
+                }
+                Key::Right => {
+                    self.step_effort(1);
+                    return Outcome::Redraw;
+                }
+                Key::Esc | Key::Enter => {
+                    self.effort_open = false;
+                    return Outcome::Redraw;
+                }
+                _ => self.effort_open = false,
+            }
+        }
         if mods.ctrl {
             match key {
                 Key::Char('q') => return Outcome::Quit,
@@ -3617,6 +3865,11 @@ impl Chat {
     /// [`Chat::frame`] at a given time (tests drive the clock).
     pub fn frame_at(&mut self, window: usize, rows: usize, now: std::time::Instant) -> Frame {
         self.motions.tick(now);
+        for (id, on) in &self.hover_targets {
+            self.motions
+                .ease(Anim::Hover(*id), f64::from(u8::from(*on)), Ease::HOVER_FADE);
+        }
+        self.hover_targets.retain(|_, on| *on);
         // Everything below lays out one column of `cols` cells; it is then
         // centered in the window.
         let window = window.max(10);
@@ -3662,10 +3915,11 @@ impl Chat {
         let stored_rows = cache.laid.rows.len();
 
         // Prompt box: at most INPUT_ROWS, scrolled so the caret stays visible.
+        let input_width = width.saturating_sub(self.input_room).max(12);
         let (input, caret) = layout::input(
             &self.editor,
-            "Describe a task or ask a question",
-            width,
+            "Do anything…",
+            input_width,
             self.mode == Mode::Chat,
         );
         // The box grows and shrinks a row at a time instead of jumping.
@@ -3765,6 +4019,7 @@ impl Chat {
         }
         let gap = usize::from(stored > 0 && !tail.rows.is_empty());
         let total = stored + gap + tail.rows.len();
+        self.tail_rows = tail.rows.clone();
         self.viewport = viewport;
         self.max_scroll = total.saturating_sub(viewport);
         self.scroll = self.scroll.min(self.max_scroll);
@@ -3799,8 +4054,18 @@ impl Chat {
             motion::fade(&mut row, NIGHT.bg, t);
             row
         };
+        self.shown_from = (start, pad);
+        let picked = self.picked_span();
+        let mark = |index: usize, row: Row| match picked {
+            Some(((r0, c0), (r1, c1))) if (r0..=r1).contains(&index) => {
+                let from = if index == r0 { c0 } else { 0 };
+                let to = if index == r1 { c1 } else { usize::MAX / 2 };
+                layout::highlight(&row, from..to, NIGHT.select)
+            }
+            _ => row,
+        };
         let mut screen: Vec<Row> = vec![Row::new(); pad];
-        screen.extend((start..end).map(faded));
+        screen.extend((start..end).map(|index| mark(index, faded(index))));
         let above = (shift > 0.0 && start > 0).then(|| faded(start - 1));
         // Cards of stored rows (prompts, code), in transcript screen rows.
         let tail_panels = tail.panels.iter().map(|(rows, cols, kind)| {
@@ -4089,7 +4354,49 @@ impl Chat {
             notice,
             generating: self.clock.generating(),
             can_send: !self.editor.is_empty() || !self.attached.is_empty(),
+            effort: self.effort_panel(),
         }
+    }
+
+    /// The effort panel as drawn this frame, its thumb and openness gliding.
+    fn effort_panel(&mut self) -> Option<EffortPanel> {
+        let levels = self.effort_levels();
+        if levels.is_empty() {
+            return None;
+        }
+        let selected = self
+            .effort()
+            .and_then(|effort| levels.iter().position(|level| *level == effort))
+            .unwrap_or(0);
+        let target = if levels.len() > 1 {
+            selected as f64 / (levels.len() - 1) as f64
+        } else {
+            0.0
+        };
+        let thumb = self.motions.ease(Anim::Effort, target, Ease::RESIZE) as f32;
+        // zeron's menu-in / menu-out.
+        let open = self.motions.ease(
+            Anim::EffortPanel,
+            f64::from(u8::from(self.effort_open)),
+            if self.effort_open {
+                Ease::MENU_IN
+            } else {
+                Ease::MENU_OUT
+            },
+        ) as f32;
+        let capital = |text: &str| -> String {
+            let mut chars = text.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        };
+        Some(EffortPanel {
+            levels: levels.iter().map(|level| capital(level.label())).collect(),
+            selected,
+            thumb,
+            open,
+        })
     }
 
     /// The picker as data (None when closed).
@@ -4212,7 +4519,7 @@ impl Chat {
             // picture, fade it in.
             Some(before) if before.doc != doc || before.width != width || refade => {
                 self.motions.forget_rows();
-                self.motions.start(Anim::Content, 0.0, 1.0, Spring::FADE);
+                self.motions.enter(Anim::Content, 0.0, 1.0, Ease::FADE_IN);
                 self.motions.snap(Anim::Scroll, self.scroll as f64);
             }
             // Rows arrived (or went): new ones fade in. Scrolled up, the view
@@ -4220,7 +4527,7 @@ impl Chat {
             Some(before) if before.total != total => {
                 if total > before.total {
                     for row in before.total..total {
-                        self.motions.start(Anim::Row(row), 0.0, 1.0, Spring::FADE);
+                        self.motions.enter(Anim::Row(row), 0.0, 1.0, Ease::FADE_IN);
                     }
                 }
                 if self.scroll > 0 {
@@ -4263,14 +4570,14 @@ impl Chat {
         }
         let current = self.picker_popup(cols, offset);
         let open = f64::from(u8::from(current.is_some()));
-        let t = self.motions.follow(Anim::Popup, open, Spring::POP);
+        let t = self.motions.ease(Anim::Popup, open, Ease::DIALOG_IN);
         if let Some(popup) = &current {
             if self.motions.value(&Anim::Popup) == Some(open)
                 && open > 0.0
                 && self.last_popup.is_none()
             {
                 // First frame open: start from closed.
-                self.motions.start(Anim::Popup, 0.0, 1.0, Spring::POP);
+                self.motions.enter(Anim::Popup, 0.0, 1.0, Ease::DIALOG_IN);
             }
             self.last_popup = Some(popup.clone());
         }
@@ -4287,7 +4594,7 @@ impl Chat {
         let pick = (self.picker.index(), self.picker.query.clone());
         if self.mode == Mode::Picker && self.seen_pick.as_ref() != Some(&pick) {
             self.seen_pick = Some(pick);
-            self.motions.start(Anim::Pick, 0.0, 1.0, Spring::FADE);
+            self.motions.enter(Anim::Pick, 0.0, 1.0, Ease::HOVER_FADE);
         }
         let lit = self.motions.value(&Anim::Pick).unwrap_or(1.0);
         for row in popup.rows.iter_mut() {
@@ -4362,7 +4669,7 @@ impl Chat {
         // A new notice fades in where the hints were.
         if self.notice != self.seen_notice {
             self.seen_notice = self.notice.clone();
-            self.motions.start(Anim::Notice, 0.0, 1.0, Spring::FADE);
+            self.motions.enter(Anim::Notice, 0.0, 1.0, Ease::FADE_QUICK);
         }
         let (row, items, right) = if let Some(notice) = self.notice.clone() {
             let paint = if notice.starts_with('✓') {
@@ -4546,6 +4853,42 @@ mod tests {
             "the calls fold away"
         );
         assert!(!hidden.iter().any(|row| row.contains("look at the files")));
+    }
+
+    #[test]
+    fn transcript_text_is_selectable_by_drag_double_and_triple_click() {
+        let body = format!("{}hello there world\n", crate::user_turn("hi"),);
+        let (chat, dir) = super::motion_tests::chat_in_dir();
+        let mut chat = chat.with_mouse().with_reduced_motion(true);
+        chat.dispatch(shroom_core::Action::Append(body));
+        let frame = chat.frame(80, 20);
+        let at = frame
+            .rows
+            .iter()
+            .position(|r| r.iter().any(|run| run.text.contains("hello")))
+            .expect("answer shown");
+        let line: String = frame.rows[at].iter().map(|run| run.text.as_str()).collect();
+        // In cells, not bytes (the answer marker is one cell, three bytes).
+        let col = line[..line.find("there").unwrap()].chars().count();
+        // Drag over "there".
+        chat.click(at, col, 1, super::Mods::default());
+        chat.drag(at, col + 5);
+        assert_eq!(chat.release().as_deref(), Some("there"));
+        // The selection is painted.
+        let frame = chat.frame(80, 20);
+        assert!(
+            frame.rows[at]
+                .iter()
+                .any(|run| run.text == "there" && run.paint.bg == Some(crate::NIGHT.select)),
+            "{:?}",
+            frame.rows[at]
+        );
+        // Double click: the word; triple: the line.
+        chat.click(at, col + 1, 2, super::Mods::default());
+        assert_eq!(chat.release().as_deref(), Some("there"));
+        chat.click(at, col + 1, 3, super::Mods::default());
+        assert_eq!(chat.release().as_deref(), Some("hello there world"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5123,9 +5466,11 @@ mod motion_tests {
         assert_eq!(paint.fg, NIGHT.bg, "starts invisible: {paint:?}");
         assert!(chat.animating());
         assert_eq!(chat.frame_interval(), crate::motion::FAST);
-        let frames = settle(&mut chat, &mut t, 40);
+        // zeron's fade-in: 500 ms on an expo-out curve, so 90 % visible
+        // in about the first 130 ms.
+        let frames = settle(&mut chat, &mut t, 60);
         assert!(
-            frames.len() * 16 < 400,
+            frames.len() * 16 <= 520,
             "settles in {} ms",
             frames.len() * 16
         );
@@ -5419,7 +5764,52 @@ mod motion_tests {
     }
 
     #[test]
-    fn popup_unfolds_with_a_pop_and_folds_away() {
+    fn effort_panel_opens_with_menu_in_and_its_thumb_glides() {
+        let (chat, dir) = chat();
+        let mut chat = chat.with_pixels();
+        let mut t = Instant::now();
+        chat.frame_at(COLS, ROWS, t);
+        chat.toggle_effort_panel();
+        t += FRAME;
+        let panel = |frame: &Frame| frame.chrome.as_ref().unwrap().effort.clone().unwrap();
+        let first = panel(&chat.frame_at(COLS, ROWS, t));
+        assert!(first.open < 0.5, "starts closed: {}", first.open);
+        let frames = settle(&mut chat, &mut t, 30);
+        let opens: Vec<f32> = frames.iter().map(|f| panel(f).open).collect();
+        assert!(opens.windows(2).all(|p| p[1] >= p[0]), "{opens:?}");
+        assert!(
+            frames.len() * 16 <= 160,
+            "menu-in: {} ms",
+            frames.len() * 16
+        );
+        assert_eq!(panel(frames.last().unwrap()).open, 1.0);
+        // A new level: the thumb glides there, never jumps or reverses.
+        let from = panel(frames.last().unwrap()).thumb;
+        chat.key(Key::Right, Mods::default());
+        t += FRAME;
+        let start = panel(&chat.frame_at(COLS, ROWS, t)).thumb;
+        assert!(
+            (start - from).abs() < 0.2,
+            "starts where it was: {from} → {start}"
+        );
+        let frames = settle(&mut chat, &mut t, 30);
+        let thumbs: Vec<f32> = frames.iter().map(|f| panel(f).thumb).collect();
+        let end = *thumbs.last().unwrap();
+        assert!(end > from, "moved right: {from} → {end}");
+        assert!(thumbs.windows(2).all(|p| p[1] >= p[0]), "{thumbs:?}");
+        assert!(frames.len() * 16 <= 220, "resize: {} ms", frames.len() * 16);
+        let ended = panel(frames.last().unwrap());
+        let n = ended.levels.len() - 1;
+        assert_eq!(
+            ended.thumb,
+            ended.selected as f32 / n as f32,
+            "ends exactly"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn popup_unfolds_with_zerons_dialog_in_and_folds_away() {
         let (mut chat, dir) = chat();
         for _ in 0..3 {
             chat.dispatch(Action::New);
@@ -5451,9 +5841,13 @@ mod motion_tests {
             .iter()
             .map(|f| f.popup.as_ref().unwrap().open)
             .collect();
-        let peak = opens.iter().cloned().fold(0.0, f64::max);
-        assert!(peak > 1.01 && peak < 1.1, "a small overshoot: {peak}");
-        assert!(frames.len() * 16 < 450, "{} ms", frames.len() * 16);
+        // zeron's dialog-in: 180 ms on `ease`, monotonic, no overshoot.
+        assert!(
+            opens.windows(2).all(|pair| pair[1] >= pair[0]),
+            "opens steadily: {opens:?}"
+        );
+        assert!(opens.iter().all(|open| *open <= 1.0));
+        assert!(frames.len() * 16 <= 220, "{} ms", frames.len() * 16);
         let open = frames.last().unwrap().popup.as_ref().unwrap();
         assert_eq!(open.open, 1.0);
         assert!(open.rows.len() >= 4, "all rows once open");

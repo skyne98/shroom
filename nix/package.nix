@@ -87,7 +87,7 @@ rustPlatform.buildRustPackage {
   desktopItems = [
     (makeDesktopItem {
       name = "shroom";
-      desktopName = "shroom";
+      desktopName = "Shroom";
       genericName = "Coding agent";
       comment = "Chat with a coding agent that works in your project";
       exec = "shroom-gpui";

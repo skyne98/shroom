@@ -34,10 +34,14 @@ animation, identical in the terminal and the window. No visible value jumps.
   frame starts at the old state, that the motion is continuous or monotonic,
   that it settles within its bound, and that it ends exactly at the new state.
 
+Curves: zeron's catalog lives in `motion.rs` too (`Ease::FADE_IN`, `MENU_IN`,
+`DIALOG_IN`, `RESIZE`, `HOVER_FADE`, ...) through `ease`/`enter`; springs stay
+for scroll and sizes, which must keep their velocity when retargeted.
+
 Animated today: transcript scroll (glide, keeps its place when content arrives
 while scrolled up), new rows (fade in), session switch, relayout, rewind and the welcome giving
 way to the chat (fade in), the window's sidebar (glides open and shut, ctrl+b),
-popup (unfolds with a pop, folds away), picker highlight (fades onto the item),
+popup (zeron's dialog-in), effort panel (menu-in, its thumb glides), hover plates (fade), picker highlight (fades onto the item),
 notices (fade in), ctx meter (counts), prompt box height (grows or shrinks a row
 at a time), scrollbar thumb (follows the shown scroll), image previews (fade
 in with their rows; real pictures follow the same fade and smooth scroll).
