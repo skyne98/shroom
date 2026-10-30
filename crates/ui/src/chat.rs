@@ -25,7 +25,7 @@ use shroom_core::Action;
 use shroom_core::DocId;
 
 use crate::editor::Editor;
-use crate::layout::{self, ACCENT, DIM, Laid, Paint, Row, run};
+use crate::layout::{self, ACCENT, DIM, Laid, Paint, Row, TEXT, run};
 use crate::motion::{self, Key as Anim, Motions, Spring};
 use crate::popup::{self, Popup};
 use crate::{Clock, Item, Mode, NIGHT, Picker, hints, spinner_word};
@@ -83,6 +83,26 @@ pub enum Cursor {
 /// One screen, top to bottom: transcript, rule, input, status. Every row is
 /// at most `cols` cells wide and there are exactly `rows` of them.
 pub struct Frame {
+    /// Cards behind transcript rows (prompts, code panels), in screen rows of
+    /// the transcript (`top` may be above the first). The terminal shows
+    /// their cells' background instead.
+    pub cards: Vec<Card>,
+    /// An empty session: what to show instead of a blank screen. The
+    /// transcript rows already hold a text version of it.
+    pub welcome: Option<Welcome>,
+    /// For pixel clients: what their own chrome shows (header, sidebar,
+    /// hint keys); None for the terminal.
+    pub chrome: Option<Chrome>,
+    /// Screen rows of the parts below the transcript.
+    pub dock: Range<usize>,
+    pub rule: usize,
+    pub chips: Option<usize>,
+    pub composer: Range<usize>,
+    pub status: usize,
+    /// Opacity of the whole transcript (session switch, rewind), 0..1.
+    pub content: f32,
+    /// Columns of the centered content column (margin..margin+width).
+    pub column: Range<usize>,
     pub rows: Vec<Row>,
     /// The first `viewport` rows are the transcript. Pixel clients draw them
     /// `shift` rows lower (0..1, smooth scrolling) with `above` peeking in on
@@ -101,6 +121,64 @@ pub struct Frame {
     /// are screen rows (a picture cut by the edge reports its visible part
     /// with `skip` rows hidden above); `fade` is its opacity, 0..1.
     pub pictures: Vec<Shown>,
+}
+
+/// A card behind a block of transcript rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Card {
+    pub top: isize,
+    pub rows: usize,
+    pub cols: Range<usize>,
+    pub kind: layout::Panel,
+    pub fade: f32,
+}
+
+/// The empty-session screen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Welcome {
+    /// Where the agent works, `~` for home.
+    pub folder: String,
+    pub branch: Option<String>,
+    pub model: String,
+    /// The key variable the model needs when it is not set.
+    pub missing_key: Option<String>,
+    /// Example tasks; `Chat::use_starter` puts one in the prompt.
+    pub starters: Vec<String>,
+}
+
+/// One session in the window's sidebar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionItem {
+    pub id: DocId,
+    pub title: String,
+    /// `4 turns · 2h`.
+    pub detail: String,
+    /// `answering`, `2 agents`, `stopped`, or empty.
+    pub state: String,
+    pub current: bool,
+}
+
+/// What a pixel client draws around the transcript.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Chrome {
+    pub title: String,
+    pub folder: String,
+    pub branch: Option<String>,
+    pub model: String,
+    /// `high thinking`.
+    pub thinking: Option<String>,
+    /// Share of the context window used, counting toward its new value.
+    pub context: Option<f64>,
+    pub sessions: Vec<SessionItem>,
+    /// Sidebar openness, 0..1 (ctrl+b), gliding.
+    pub sidebar: f32,
+    /// Key hints, `ctrl+p commands`: `Chat::press` runs one.
+    pub hints: Vec<String>,
+    /// A notice in place of the hints: (text, good news, fade 0..1).
+    pub notice: Option<(String, bool, f32)>,
+    pub generating: bool,
+    /// Something to send (the send button is live).
+    pub can_send: bool,
 }
 
 /// One picture on screen.
@@ -171,6 +249,8 @@ enum Msg {
         doc: DocId,
         result: Result<Run, AiError>,
         messages: Vec<Message>,
+        /// Files the run changed (from the turn's snapshots).
+        changed: Vec<String>,
     },
 }
 
@@ -260,14 +340,16 @@ impl Worker {
                     let (done, ()) = tokio::join!(run, forward);
                     done
                 });
-                if let Some(turn) = turn {
-                    git::end_turn(&marks, turn);
-                }
+                let changed = match turn {
+                    Some(turn) => git::end_turn(&marks, turn),
+                    None => Vec::new(),
+                };
                 if outbox
                     .send(Msg::Done {
                         doc,
                         result,
                         messages,
+                        changed,
                     })
                     .is_err()
                 {
@@ -312,6 +394,13 @@ struct Settings {
     /// model is the last resort. ctrl+k in the model picker toggles one.
     #[serde(default)]
     compaction: Vec<String>,
+    /// The window's session sidebar is open (ctrl+b).
+    #[serde(default = "open")]
+    sidebar: bool,
+}
+
+fn open() -> bool {
+    true
 }
 
 impl Settings {
@@ -327,6 +416,7 @@ impl Settings {
             effort: None,
             details: false,
             compaction: Vec::new(),
+            sidebar: true,
         })
     }
 
@@ -341,7 +431,7 @@ impl Settings {
 /// (provider, context, price, `✻` thinks, `▣` sees images, `⟲N` Nth
 /// compaction model). Every hint has the same width, so the columns line up
 /// and the marks never get cut off; long names give way instead.
-fn model_labels(entries: &[&Entry], compaction: &[String]) -> Vec<String> {
+fn model_labels(entries: &[&Entry], compaction: &[String]) -> (Vec<String>, String) {
     let context = |entry: &Entry| match entry.context {
         n if n >= 1_000_000 => format!("{}M", n / 1_000_000),
         n if n >= 1_000 => format!("{}k", n / 1_000),
@@ -361,11 +451,16 @@ fn model_labels(entries: &[&Entry], compaction: &[String]) -> Vec<String> {
             .unwrap_or(0)
     };
     let (pw, cw, rw) = (
-        widest(&|entry| entry.provider.clone()),
-        widest(&context),
-        widest(&price),
+        widest(&|entry| entry.provider.clone()).max("provider".len()),
+        widest(&context).max("context".len()),
+        widest(&price).max("$ in/out per 1M".len()),
     );
-    entries
+    let order = if compaction.is_empty() { "" } else { "  ⟲  " };
+    let header = format!(
+        "{:<pw$}  {:>cw$}  {:<rw$}  ✻ ▣{order}",
+        "provider", "context", "$ in/out per 1M"
+    );
+    let labels = entries
         .iter()
         .map(|entry| {
             let thinks = if entry.efforts.is_empty() { ' ' } else { '✻' };
@@ -383,7 +478,8 @@ fn model_labels(entries: &[&Entry], compaction: &[String]) -> Vec<String> {
                 price(entry)
             )
         })
-        .collect()
+        .collect();
+    (labels, header)
 }
 
 /// What a subagent is called on screen: the parent's title for it, else the
@@ -399,6 +495,7 @@ fn agent_title(info: &AgentInfo) -> String {
 /// Shift a laid-out frame `margin` cells right: its rows, click cursors and
 /// scrollbars. The popup is centered by the clients, so it stays.
 fn center(frame: &mut Frame, margin: usize) {
+    frame.column = frame.column.start + margin..frame.column.end + margin;
     if margin == 0 {
         return;
     }
@@ -416,6 +513,9 @@ fn center(frame: &mut Frame, margin: usize) {
     }
     for shown in &mut frame.pictures {
         shown.picture.col += margin;
+    }
+    for card in &mut frame.cards {
+        card.cols = card.cols.start + margin..card.cols.end + margin;
     }
 }
 
@@ -610,6 +710,88 @@ fn percent_decode(text: &str) -> String {
 
 /// Title of the transcript row while compaction runs.
 const COMPACTING: &str = "compacting context…";
+
+/// `KEY=value` lines of `dir/keys.env` (keys entered in the app) go into the
+/// environment at start, where every provider reads its key; a key set in
+/// the environment already wins.
+fn load_keys(dir: &std::path::Path) {
+    let Ok(text) = std::fs::read_to_string(dir.join("keys.env")) else {
+        return;
+    };
+    for (name, value) in text.lines().filter_map(|line| line.split_once('=')) {
+        let (name, value) = (name.trim(), value.trim());
+        let set = std::env::var_os(name).is_some_and(|old| !old.is_empty());
+        if !name.is_empty() && !value.is_empty() && !set {
+            // SAFETY: called while the app starts, before any thread reads
+            // the environment.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+}
+
+/// Keep `name=value` in `dir/keys.env` (readable by the user only) and set
+/// it for this run.
+fn save_key(dir: &std::path::Path, name: &str, value: &str) -> std::io::Result<()> {
+    let path = dir.join("keys.env");
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.split_once('=')
+                .is_none_or(|(key, _)| key.trim() != name)
+        })
+        .map(String::from)
+        .collect();
+    lines.push(format!("{name}={value}"));
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&path, lines.join("\n") + "\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    // SAFETY: the UI thread sets it between runs; the worker only reads keys
+    // when the next run starts.
+    unsafe { std::env::set_var(name, value) };
+    Ok(())
+}
+
+/// `/home/fox/Project/x` → `~/Project/x`.
+fn home_short(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && text.starts_with(&home) => {
+            format!("~{}", &text[home.len()..])
+        }
+        _ => text,
+    }
+}
+
+/// The `✎` line under an answer: how many files the turn changed, then
+/// the first few of them.
+fn changes_line(changed: &[String]) -> String {
+    const SHOWN: usize = 4;
+    let count = match changed.len() {
+        1 => "1 file changed".to_string(),
+        n => format!("{n} files changed"),
+    };
+    let mut names: Vec<&str> = changed.iter().take(SHOWN).map(String::as_str).collect();
+    let more = changed.len().saturating_sub(SHOWN);
+    let more = if more > 0 {
+        format!(" +{more} more")
+    } else {
+        String::new()
+    };
+    names.retain(|name| !name.contains('\t'));
+    format!("{}{count}\t{}{more}\n", crate::CHANGES, names.join(", "))
+}
+
+/// Example tasks on the empty screen.
+const STARTERS: [&str; 3] = [
+    "Explain how this project is put together",
+    "Find and fix a failing test",
+    "Review my uncommitted changes",
+];
 
 /// 182400 → `182k`.
 fn tokens(n: u64) -> String {
@@ -817,7 +999,7 @@ fn history(body: &[String]) -> Vec<Message> {
                 text.push('\n');
             }
             // Logs and failure notes are for the user, not model context.
-            Role::Program | Role::Call | Role::Fail | Role::Agent => {}
+            Role::Program | Role::Call | Role::Fail | Role::Agent | Role::Changes => {}
         }
         if !user.is_empty() {
             let images = std::mem::take(&mut shown);
@@ -887,7 +1069,10 @@ fn friendly_error(err: &AiError, model: &str, key_env: Option<&str>) -> String {
     let detail: String = err.message.chars().take(90).collect();
     match err.kind {
         Kind::Auth => {
-            format!("{provider} rejected the API key · check {key}, restart · ctrl+l other model")
+            let _ = key;
+            format!(
+                "{provider} rejected the API key · ctrl+k enters a new key · ctrl+l other model"
+            )
         }
         Kind::Billing => {
             format!("{provider} account is out of credit · top up, or ctrl+l other model")
@@ -958,6 +1143,7 @@ fn binding(hint: &str) -> Option<(Key, Mods)> {
             "esc" => key = Some(Key::Esc),
             "tab" => key = Some(Key::Tab),
             "del" => key = Some(Key::Delete),
+            "f1" => key = Some(Key::F(1)),
             "f2" => key = Some(Key::F(2)),
             "↑" => key = Some(Key::PageUp),
             "↓" => key = Some(Key::PageDown),
@@ -982,7 +1168,7 @@ struct InputSpot {
 /// maximized terminal) it is a centered column: lines stay readable, the
 /// eye never crosses the whole screen to get from text to its status.
 /// ponytail: a constant; make it a setting if someone wants it wider.
-const COLUMN: usize = 110;
+pub const COLUMN: usize = 110;
 
 /// Prompt rows shown at most; more scroll inside the box.
 const INPUT_ROWS: usize = 6;
@@ -997,6 +1183,10 @@ enum Pick {
     Rename,
     /// This session's prompts, newest first: pick one to go back to.
     Rewind,
+    /// Keys and symbols (f1).
+    Help,
+    /// The API key field for the current model's provider (ctrl+k).
+    Key,
     /// What to restore of the prompt picked in [`Pick::Rewind`].
     RewindHow,
 }
@@ -1017,6 +1207,9 @@ enum Command {
     Stop,
     Quit,
     Rewind,
+    Help,
+    ApiKey,
+    Sidebar,
     Session(DocId),
 }
 
@@ -1075,6 +1268,18 @@ pub struct Chat {
     last_esc: Option<std::time::Instant>,
     /// The transcript changed in place (a rewind): fade it in as a whole.
     refade: bool,
+    /// The provider refused the key: offer the key field (ctrl+k).
+    key_wanted: bool,
+    /// The key variable the open key field sets.
+    entering_key: Option<String>,
+    /// The last frame showed the welcome.
+    was_welcome: bool,
+    /// Column names of the model list.
+    model_header: String,
+    /// Widest the content column gets, in cells.
+    column: usize,
+    /// Columns of the whole window, last frame.
+    window_cols: usize,
     /// Folded runs the user opened, per session (keyed by line index).
     unfolded: HashMap<DocId, std::collections::HashSet<usize>>,
     /// The session being renamed, and whether to go back to the session
@@ -1143,6 +1348,7 @@ impl Chat {
         client.start();
         crate::highlight::warm();
         let dir = root;
+        load_keys(&dir);
         let settings_path = dir.join("settings.json");
         let settings = Settings::load(&settings_path);
         let compactor = Arc::new(Compactor::new(Some(dir.join("limits.json"))));
@@ -1180,6 +1386,12 @@ impl Chat {
             rewind_at: None,
             last_esc: None,
             refade: false,
+            key_wanted: false,
+            entering_key: None,
+            was_welcome: false,
+            model_header: String::new(),
+            column: COLUMN,
+            window_cols: 0,
             unfolded: HashMap::new(),
             renaming: None,
             wheel_rest: 0.0,
@@ -1491,6 +1703,12 @@ impl Chat {
 
     /// Last column of a transcript row, while the chat is scrollable.
     fn on_scrollbar(&self, row: usize, col: usize) -> bool {
+        // The window draws it at its right edge, away from the text.
+        if self.pixels {
+            return self.max_scroll > 0
+                && row < self.viewport
+                && col + self.margin + 1 >= self.window_cols;
+        }
         // The last cell of the column; with no margin, the window edge too.
         let edge = if self.margin == 0 {
             usize::MAX
@@ -1604,7 +1822,8 @@ impl Chat {
                     doc,
                     result,
                     messages,
-                } => self.finish(doc, result, messages),
+                    changed,
+                } => self.finish(doc, result, messages, changed),
             }
         }
         changed
@@ -1888,7 +2107,13 @@ impl Chat {
 
     /// Store the finished answer in the session it was asked in, even if the
     /// user switched sessions meanwhile.
-    fn finish(&mut self, doc: DocId, result: Result<Run, AiError>, messages: Vec<Message>) {
+    fn finish(
+        &mut self,
+        doc: DocId,
+        result: Result<Run, AiError>,
+        messages: Vec<Message>,
+        changed: Vec<String>,
+    ) {
         let mut segments = std::mem::take(&mut self.live);
         // Calls still running when the run ended were killed with it.
         for segment in &mut segments {
@@ -1925,11 +2150,17 @@ impl Chat {
             Err(err) => {
                 let key = self.entry().and_then(Entry::key_env).map(String::from);
                 let line = friendly_error(err, &self.settings.model, key.as_deref());
-                // In the chat too, so it survives the next keypress.
+                // In the chat, where it stays; the status line keeps its
+                // hints (enter continues) instead of repeating it.
                 body.push_str(&format!("{}{line}\n", crate::FAIL));
-                self.notice = Some(line);
                 self.failed = Some(doc);
+                if err.kind == Kind::Auth {
+                    self.key_wanted = true;
+                }
             }
+        }
+        if !changed.is_empty() {
+            body.push_str(&changes_line(&changed));
         }
         if !body.trim().is_empty() {
             self.append_to(doc, &format!("{body}\n"));
@@ -2363,9 +2594,9 @@ impl Chat {
                 self.models_wanted = true;
                 self.notice = Some("loading the model list…".into());
             } else {
-                self.notice = Some(
-                    "no API keys found · export e.g. DEEPSEEK_API_KEY or ANTHROPIC_API_KEY".into(),
-                );
+                // No model has a key yet: ask for one right here.
+                self.open_key();
+                self.notice = Some("no API key yet · paste one for this model's provider".into());
             }
             return;
         }
@@ -2386,7 +2617,9 @@ impl Chat {
             )
         });
         self.model_keys = entries.iter().map(|entry| entry.key()).collect();
-        let items = model_labels(&entries, &self.settings.compaction)
+        let (labels, header) = model_labels(&entries, &self.settings.compaction);
+        self.model_header = header;
+        let items = labels
             .into_iter()
             .enumerate()
             .map(|(index, label)| Item {
@@ -2413,7 +2646,8 @@ impl Chat {
             return Outcome::Redraw;
         };
         match self.pick {
-            Pick::Rename => {}
+            Pick::Rename | Pick::Key => {}
+            Pick::Help => {}
             Pick::Rewind => {
                 self.open_rewind_how(id as usize);
                 return Outcome::Redraw;
@@ -2491,9 +2725,15 @@ impl Chat {
                 ToggleThinking,
                 format!("{reasoning} reasoning and tool calls\tctrl+o"),
             ),
-            (CompactionModels, "Choose compaction models…\tctrl+k".into()),
+            (
+                CompactionModels,
+                "Choose compaction models…\tctrl+k in models".into(),
+            ),
             (CopyCode, "Copy last code block\tctrl+y".into()),
             (Rewind, "Rewind to an earlier prompt…\tesc esc".into()),
+            (Help, "Keys and symbols\tf1".into()),
+            (ApiKey, "Enter an API key…\tctrl+k".into()),
+            (Sidebar, "Show or hide the sidebar\tctrl+b".into()),
             (RenameSession, "Rename this session…\tf2".into()),
             (DeleteSession, "Delete this session…\tctrl+w".into()),
             (Quit, "Quit\tctrl+q".into()),
@@ -2550,12 +2790,284 @@ impl Chat {
             }
             Command::Quit => return Outcome::Quit,
             Command::Rewind => self.open_rewind(),
+            Command::Help => self.open_help(),
+            Command::ApiKey => self.open_key(),
+            Command::Sidebar => self.toggle_sidebar(),
             Command::Session(id) => {
                 self.dispatch(Action::Select(id));
                 self.scroll = 0;
             }
         }
         Outcome::Redraw
+    }
+
+    /// Every key and what the marks on screen mean, searchable (f1).
+    fn open_help(&mut self) {
+        let lines: [(&str, &str); 24] = [
+            ("Send the message", "enter"),
+            ("New line in the message", "shift+enter"),
+            ("Stop the answer", "esc"),
+            ("Rewind to an earlier prompt", "esc esc"),
+            ("All commands", "ctrl+p"),
+            ("Switch session", "ctrl+s"),
+            ("New session", "ctrl+n"),
+            ("Rename this session", "f2"),
+            ("Switch model", "ctrl+l"),
+            ("Thinking level", "shift+tab"),
+            ("Show or fold reasoning and tool calls", "ctrl+o"),
+            ("Enter an API key", "ctrl+k"),
+            ("Show or hide the sidebar (window)", "ctrl+b"),
+            ("Copy the last code block", "ctrl+y"),
+            ("Zoom in, out, reset (window)", "ctrl+= ctrl+- ctrl+0"),
+            ("Quit", "ctrl+q"),
+            ("▸ finished work, folded: click opens", "▸"),
+            ("✓ ✗ a tool call succeeded or failed", "✓ ✗"),
+            ("◆ a subagent: a separate run working on a subtask", "◆"),
+            ("✎ files this answer changed", "✎"),
+            ("✻ the model thinking", "✻"),
+            ("▣ an image; in the model list: it can see images", "▣"),
+            ("⟲ a model that writes compaction summaries", "⟲"),
+            ("context % used: how full the model's memory is", "context"),
+        ];
+        let items = lines
+            .iter()
+            .enumerate()
+            .map(|(index, (what, keys))| Item {
+                id: index as u64,
+                label: format!("{what}\t{keys}"),
+            })
+            .collect();
+        self.picker.set_items(items);
+        self.picker.clear();
+        self.pick = Pick::Help;
+        self.mode = Mode::Picker;
+    }
+
+    /// The API key field for the current model's provider (ctrl+k). Saved
+    /// in the data dir's `keys.env`, used from the next message on.
+    fn open_key(&mut self) {
+        let name = self
+            .entry()
+            .and_then(|entry| entry.env.first().cloned())
+            .unwrap_or_else(|| match self.settings.model.split_once('|') {
+                Some(_) => "SHROOM_KEY".to_string(),
+                None => format!(
+                    "{}_API_KEY",
+                    self.settings
+                        .model
+                        .split('/')
+                        .next()
+                        .unwrap_or("DEEPSEEK")
+                        .to_uppercase()
+                        .replace('-', "_")
+                ),
+            });
+        self.picker.set_items(Vec::new());
+        self.picker.clear();
+        self.entering_key = Some(name);
+        self.key_wanted = false;
+        self.pick = Pick::Key;
+        self.mode = Mode::Picker;
+    }
+
+    fn key_field(&mut self, key: Key, ctrl: bool) {
+        match key {
+            Key::Enter => {
+                let value = self.picker.query.trim().to_string();
+                if let Some(name) = self.entering_key.take()
+                    && !value.is_empty()
+                {
+                    self.notice = Some(match save_key(&self.data_dir, &name, &value) {
+                        Ok(()) => format!("✓ {name} saved · used from the next message"),
+                        Err(err) => format!("could not save the key: {err}"),
+                    });
+                }
+                self.picker.clear();
+                self.mode = Mode::Chat;
+            }
+            Key::Esc => {
+                self.entering_key = None;
+                self.picker.clear();
+                self.mode = Mode::Chat;
+            }
+            Key::Backspace => self.picker.backspace(),
+            Key::Char('u') if ctrl => self.picker.clear(),
+            Key::Char(character) if !ctrl => self.picker.push(character),
+            _ => {}
+        }
+    }
+
+    /// Show or hide the window's session sidebar (ctrl+b); remembered.
+    fn toggle_sidebar(&mut self) {
+        self.settings.sidebar = !self.settings.sidebar;
+        self.settings.save(&self.settings_path);
+    }
+
+    /// A narrower content column (the window sets prose in a wider font).
+    pub fn with_column(mut self, cells: usize) -> Self {
+        self.column = cells.max(40);
+        self
+    }
+
+    /// Caret to byte `at` of the prompt row on screen row `row`, for pixel
+    /// clients that hit-test the proportional text themselves; `count` and
+    /// `shift` as in [`Chat::click`].
+    pub fn click_text(&mut self, row: usize, at: usize, count: usize, shift: bool) {
+        let Some(spot) = self.input_map.iter().find(|spot| spot.screen_row == row) else {
+            return;
+        };
+        let at = (spot.start + at).min(spot.end);
+        self.notice = None;
+        if self.mode != Mode::Chat {
+            self.mode = Mode::Chat;
+        }
+        match count {
+            1 => self.editor.move_to(at, shift),
+            2 => self.editor.select_word_at(at),
+            _ => self.editor.select_line_at(at),
+        }
+        self.dragging = true;
+    }
+
+    /// Drag the prompt selection to byte `at` of screen row `row` (rows
+    /// past the box clamp to its first or last).
+    pub fn drag_text(&mut self, row: usize, at: usize) -> bool {
+        if !self.dragging {
+            return false;
+        }
+        let (Some(first), Some(last)) = (self.input_map.first(), self.input_map.last()) else {
+            return false;
+        };
+        let row = row.clamp(first.screen_row, last.screen_row);
+        let Some(spot) = self.input_map.iter().find(|spot| spot.screen_row == row) else {
+            return false;
+        };
+        let at = (spot.start + at).min(spot.end);
+        let before = (self.editor.cursor(), self.editor.selection());
+        self.editor.move_to(at, true);
+        before != (self.editor.cursor(), self.editor.selection())
+    }
+
+    /// Byte span of the prompt row on screen row `row` (to hit-test it).
+    pub fn input_span(&self, row: usize) -> Option<(usize, usize)> {
+        self.input_map
+            .iter()
+            .find(|spot| spot.screen_row == row)
+            .map(|spot| (spot.start, spot.end))
+    }
+
+    /// The prompt's text (pixel clients hit-test their own rows of it).
+    pub fn input_text(&self) -> &str {
+        self.editor.text()
+    }
+
+    /// Stop the answer in flight (the window's stop button).
+    pub fn stop(&mut self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+        }
+    }
+
+    /// A list or dialog is open.
+    pub fn picking(&self) -> bool {
+        self.mode == Mode::Picker
+    }
+
+    /// The model's display name (a custom endpoint: its model id).
+    fn model_name(&self) -> String {
+        match self.entry() {
+            Some(entry) => entry.name.clone(),
+            None => match self.settings.model.split_once('|') {
+                Some((_, id)) => id.to_string(),
+                None => self
+                    .settings
+                    .model
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            },
+        }
+    }
+
+    /// Put starter `index` of the empty screen in the prompt.
+    pub fn use_starter(&mut self, index: usize) {
+        if let Some(text) = STARTERS.get(index) {
+            self.editor = Editor::default();
+            self.editor.insert(text);
+        }
+    }
+
+    /// Run a status hint as if its keys were pressed (`ctrl+p commands`).
+    pub fn press(&mut self, hint: &str) -> Outcome {
+        match binding(hint) {
+            Some((key, mods)) => self.key(key, mods),
+            None => Outcome::Redraw,
+        }
+    }
+
+    /// Open session `id` (the window's sidebar).
+    pub fn open_session(&mut self, id: DocId) {
+        self.dispatch(Action::Select(id));
+        self.scroll = 0;
+        self.mode = Mode::Chat;
+    }
+
+    /// What the empty screen shows, for session `doc` when it has no turns.
+    fn welcome(&self) -> Option<Welcome> {
+        let doc = self.client.app().selected()?;
+        if !doc.body.trim().is_empty() || self.live_doc == Some(doc.id) {
+            return None;
+        }
+        let cwd = self.cwd();
+        let model = self.model_name();
+        let missing_key = match self.entry() {
+            Some(entry) if !entry.available() => entry.env.first().cloned(),
+            _ => None,
+        };
+        Some(Welcome {
+            folder: home_short(&cwd),
+            branch: git::branch(&cwd),
+            model,
+            missing_key,
+            starters: STARTERS.iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    /// The empty screen as rows, for the terminal (the window draws its own).
+    fn welcome_rows(welcome: &Welcome, width: usize) -> Vec<Row> {
+        let mut rows = vec![
+            vec![run("shroom", ACCENT.bold())],
+            Row::new(),
+            vec![run("Working in ", DIM), run(welcome.folder.clone(), TEXT)],
+        ];
+        if let Some(branch) = &welcome.branch {
+            rows.push(vec![run("Branch     ", DIM), run(branch.clone(), TEXT)]);
+        }
+        rows.push(vec![
+            run("Model      ", DIM),
+            run(welcome.model.clone(), TEXT),
+        ]);
+        if let Some(key) = &welcome.missing_key {
+            rows.push(vec![
+                run("           ", DIM),
+                run(
+                    format!("no key set ({key}) · ctrl+k enters one"),
+                    Paint::fg(NIGHT.code),
+                ),
+            ]);
+        }
+        rows.push(Row::new());
+        rows.push(vec![run("Try", DIM)]);
+        for starter in &welcome.starters {
+            rows.push(vec![
+                run("  ", DIM),
+                run(layout::clip(starter, width.saturating_sub(2)), TEXT.sans()),
+            ]);
+        }
+        rows.push(Row::new());
+        rows.push(vec![run("f1 lists every key", DIM)]);
+        rows
     }
 
     /// Where session `doc`'s rewind marks and file snapshots are kept.
@@ -2772,10 +3284,9 @@ impl Chat {
             .map(|key| self.catalog.find(key))
             .collect();
         if let Some(entries) = entries {
-            for (index, label) in model_labels(&entries, &self.settings.compaction)
-                .into_iter()
-                .enumerate()
-            {
+            let (labels, header) = model_labels(&entries, &self.settings.compaction);
+            self.model_header = header;
+            for (index, label) in labels.into_iter().enumerate() {
                 self.picker.relabel(index as u64, label);
             }
         }
@@ -2818,6 +3329,10 @@ impl Chat {
     fn picker_key(&mut self, key: Key, ctrl: bool) -> Outcome {
         if self.pick == Pick::Rename {
             self.rename_key(key, ctrl);
+            return Outcome::Redraw;
+        }
+        if self.pick == Pick::Key {
+            self.key_field(key, ctrl);
             return Outcome::Redraw;
         }
         // Waiting for "delete this session?": y deletes, anything else keeps it.
@@ -2871,7 +3386,12 @@ impl Chat {
                 Command::Session(doc) => Some(*doc),
                 _ => None,
             },
-            Pick::Models | Pick::Rename | Pick::Rewind | Pick::RewindHow => None,
+            Pick::Models
+            | Pick::Rename
+            | Pick::Rewind
+            | Pick::RewindHow
+            | Pick::Help
+            | Pick::Key => None,
         }
     }
 
@@ -2894,7 +3414,10 @@ impl Chat {
                     self.start_rename(id, false);
                 }
             }
-            Key::Char('a') if ctrl => editor.select_all(),
+            Key::F(1) => self.open_help(),
+            Key::Char('k') if ctrl => self.open_key(),
+            Key::Char('b') if ctrl => self.toggle_sidebar(),
+            Key::Char('a') if ctrl => self.editor.select_all(),
             Key::Char('z' | 'Z') if ctrl && shift => editor.redo(),
             Key::Char('Z') if ctrl => editor.redo(),
             Key::Char('z') if ctrl => editor.undo(),
@@ -3097,7 +3620,8 @@ impl Chat {
         // Everything below lays out one column of `cols` cells; it is then
         // centered in the window.
         let window = window.max(10);
-        let cols = window.min(COLUMN);
+        let cols = window.min(self.column);
+        self.window_cols = window;
         let margin = (window - cols) / 2;
         self.margin = margin;
         let view = self.client.view();
@@ -3131,14 +3655,16 @@ impl Chat {
             });
         }
         // Out of self for the frame, so animation state can change meanwhile.
-        let Some(cache) = self.cache.take() else {
+        let Some(mut cache) = self.cache.take() else {
             unreachable!("cache was just filled");
         };
+        // The welcome rows are this frame's only; the stored layout stays.
+        let stored_rows = cache.laid.rows.len();
 
         // Prompt box: at most INPUT_ROWS, scrolled so the caret stays visible.
         let (input, caret) = layout::input(
             &self.editor,
-            "type a message",
+            "Describe a task or ask a question",
             width,
             self.mode == Mode::Chat,
         );
@@ -3171,6 +3697,20 @@ impl Chat {
         let chips = self.chips(width);
         let viewport = rows.saturating_sub(2 + shown + dock_shown + usize::from(chips.is_some()));
 
+        // An empty session: its welcome, as rows (the window draws its own
+        // over them).
+        let welcome = self.welcome();
+        if let Some(welcome) = &welcome
+            && cache.laid.rows.is_empty()
+            && !self.pixels
+        {
+            cache.laid.rows = Self::welcome_rows(welcome, width);
+        }
+        // The welcome giving way to the chat (or back) is a new picture.
+        if welcome.is_some() != self.was_welcome {
+            self.was_welcome = welcome.is_some();
+            self.refade = self.seen.is_some();
+        }
         // Live tail: the answer in flight (only in the session that asked),
         // then a spinner row with time, tokens and how to stop.
         let stored = cache.laid.rows.len();
@@ -3195,14 +3735,15 @@ impl Chat {
         {
             let word = spinner_word(elapsed);
             let tokens = if self.usage.output > 0 {
-                format!(" · ↓{} tok", self.usage.output)
+                format!(" · {} tokens written", self.usage.output)
             } else {
                 String::new()
             };
-            // How much of what this run sent came from the prompt cache.
+            // How much of what this run sent came from the prompt cache
+            // (cheaper and faster); nothing to say before it reuses any.
             let tokens = match cached_share(&self.usage) {
-                Some(share) => format!("{tokens} · {share:.0}% cached"),
-                None => tokens,
+                Some(share) if share >= 1.0 => format!("{tokens} · {share:.0}% reused"),
+                _ => tokens,
             };
             // Waiting to retry: say why and how long, in warning colour.
             let waiting = self.retrying.as_ref().and_then(|(why, at)| {
@@ -3261,6 +3802,30 @@ impl Chat {
         let mut screen: Vec<Row> = vec![Row::new(); pad];
         screen.extend((start..end).map(faded));
         let above = (shift > 0.0 && start > 0).then(|| faded(start - 1));
+        // Cards of stored rows (prompts, code), in transcript screen rows.
+        let tail_panels = tail.panels.iter().map(|(rows, cols, kind)| {
+            (
+                rows.start + stored + gap..rows.end + stored + gap,
+                cols.clone(),
+                *kind,
+            )
+        });
+        let cards: Vec<Card> = cache
+            .laid
+            .panels
+            .iter()
+            .cloned()
+            .chain(tail_panels)
+            .filter(|(rows, ..)| rows.end > start && rows.start < end)
+            .map(|(rows, cols, kind)| Card {
+                top: pad as isize + rows.start as isize - start as isize,
+                rows: rows.len(),
+                cols,
+                kind,
+                fade: (self.motions.value(&Anim::Row(rows.start)).unwrap_or(1.0) * whole_fade)
+                    as f32,
+            })
+            .collect();
 
         self.cols = cols;
         self.total = total;
@@ -3338,16 +3903,21 @@ impl Chat {
         }
 
         // The dock unfolds from its top as it grows (oldest agent first).
+        let dock_at = screen.len();
         for row in dock.into_iter().take(dock_shown) {
             screen.push(row);
             hits.push(None);
         }
+        let dock_range = dock_at..screen.len();
+        let rule = screen.len();
         screen.push(vec![run("─".repeat(cols), Paint::fg(NIGHT.faint))]);
         hits.push(None);
+        let chips_at = chips.is_some().then_some(screen.len());
         if let Some(chips) = chips {
             screen.push(chips);
             hits.push(None);
         }
+        let composer_at = screen.len();
         self.input_map.clear();
         for (index, row) in input.into_iter().enumerate() {
             self.input_map.push(InputSpot {
@@ -3359,10 +3929,14 @@ impl Chat {
             hits.push(Some(Hit::Input(index)));
             screen.push(row.row);
         }
+        let composer = composer_at..screen.len();
         let (status, zones) = self.status(cols, cache.has_code, &view);
+        cache.laid.rows.truncate(stored_rows);
         self.cache = Some(cache);
         hits.push(self.mouse.then_some(Hit::Zones(zones)));
+        let status_at = screen.len();
         screen.push(status);
+        let chrome = self.pixels.then(|| self.chrome(&view));
         let cursors = hits
             .iter()
             .map(|hit| match hit {
@@ -3387,6 +3961,16 @@ impl Chat {
         self.hits = hits;
         let popup = self.animate_popup(cols);
         let mut frame = Frame {
+            cards,
+            welcome,
+            chrome,
+            dock: dock_range,
+            rule,
+            chips: chips_at,
+            composer,
+            status: status_at,
+            content: whole_fade as f32,
+            column: 0..cols,
             rows: screen,
             viewport,
             shift,
@@ -3400,6 +3984,114 @@ impl Chat {
         frame
     }
 
+    /// What the window draws around the transcript: header, sidebar, keys.
+    fn chrome(&mut self, view: &shroom_core::View) -> Chrome {
+        let cwd = self.cwd();
+        let current = self.client.app().selected().map(|doc| doc.id);
+        let now = std::time::SystemTime::now();
+        let infos = self.sessions();
+        let sessions = infos
+            .iter()
+            .map(|session| {
+                let running = self.agents.get(&session.id).map_or(0, |list| {
+                    list.iter()
+                        .filter(|info| info.status == Status::Running)
+                        .count()
+                });
+                let state = if self.live_doc == Some(session.id) {
+                    "answering".to_string()
+                } else if running > 0 {
+                    format!("{running} agent{}", if running == 1 { "" } else { "s" })
+                } else if self.failed == Some(session.id) {
+                    "stopped".to_string()
+                } else {
+                    String::new()
+                };
+                let turns = match session.turns {
+                    0 => "empty".to_string(),
+                    1 => "1 turn".to_string(),
+                    n => format!("{n} turns"),
+                };
+                let when = session.used.map_or_else(String::new, |used| ago(used, now));
+                SessionItem {
+                    id: session.id,
+                    title: if is_default_title(&session.title) {
+                        "New session".to_string()
+                    } else {
+                        session.title.clone()
+                    },
+                    detail: if when.is_empty() {
+                        turns
+                    } else {
+                        format!("{turns} · {when}")
+                    },
+                    state,
+                    current: current == Some(session.id),
+                }
+            })
+            .collect();
+        let title = view
+            .rows
+            .iter()
+            .find(|row| row.selected)
+            .map(|row| {
+                if is_default_title(&row.text) {
+                    "New session".to_string()
+                } else {
+                    row.text.clone()
+                }
+            })
+            .unwrap_or_default();
+        let model = self.model_name();
+        let context = current
+            .and_then(|doc| self.context.get(&doc).copied())
+            .map(|share| self.motions.follow(Anim::Context, share, Spring::COUNT));
+        let sidebar = self.motions.follow(
+            Anim::Sidebar,
+            f64::from(u8::from(self.settings.sidebar)),
+            Spring::GLIDE,
+        ) as f32;
+        let typing = match self.mode {
+            Mode::Picker => self.picker.query_typed(),
+            Mode::Chat => !self.editor.is_empty(),
+        };
+        let mut keys: Vec<String> = Vec::new();
+        if self.key_wanted {
+            keys.push("ctrl+k enter API key".into());
+        }
+        let viewed = current;
+        if self.mode == Mode::Chat && self.failed.is_some() && self.failed == viewed && !typing {
+            keys.push("enter continue".into());
+        }
+        keys.extend(
+            hints(self.mode, typing, self.clock.generating())
+                .split(" · ")
+                .map(String::from),
+        );
+        keys.truncate(HINTS);
+        let notice = self.notice.clone().map(|text| {
+            let fade = self.motions.value(&Anim::Notice).unwrap_or(1.0) as f32;
+            let good = text.starts_with('✓');
+            (text.trim_start_matches("✓ ").to_string(), good, fade)
+        });
+        Chrome {
+            title,
+            folder: home_short(&cwd),
+            branch: git::branch(&cwd),
+            model,
+            thinking: self
+                .effort()
+                .map(|effort| format!("{} thinking", effort.label())),
+            context,
+            sessions,
+            sidebar,
+            hints: keys,
+            notice,
+            generating: self.clock.generating(),
+            can_send: !self.editor.is_empty() || !self.attached.is_empty(),
+        }
+    }
+
     /// The picker as data (None when closed).
     /// The open list as a popup; `offset` is where its view is (in rows,
     /// gliding between whole rows while it scrolls).
@@ -3410,6 +4102,18 @@ impl Chat {
                 "rename session".into(),
                 &self.picker.query,
                 "a name for this session",
+                width,
+            ));
+        }
+        if self.mode == Mode::Picker && self.pick == Pick::Key {
+            let width = 64.min(cols.saturating_sub(10));
+            let name = self.entering_key.clone().unwrap_or_default();
+            // Shown as dots: a key on screen ends up in screenshots.
+            let hidden = "•".repeat(self.picker.query.chars().count());
+            return Some(popup::field(
+                format!("api key · {name}"),
+                &hidden,
+                "paste the key, enter saves it",
                 width,
             ));
         }
@@ -3450,6 +4154,8 @@ impl Chat {
                 Pick::Rename => "rename",
                 Pick::Rewind => "rewind to before",
                 Pick::RewindHow => "rewind",
+                Pick::Help => "keys and symbols",
+                Pick::Key => "api key",
             };
             let title = format!("{what} {}", self.picker.counter());
             let mut popup = popup::picker(
@@ -3460,6 +4166,10 @@ impl Chat {
                 self.picker.len(),
                 whole,
             );
+            if self.pick == Pick::Models {
+                popup.header = Some(self.model_header.clone());
+                popup.title = format!("{} · ✻ thinks · ▣ sees images", popup.title);
+            }
             if !items.is_empty() {
                 popup.window = window;
                 popup.shift = shift;
@@ -3630,7 +4340,7 @@ impl Chat {
             };
             let effort = self
                 .effort()
-                .map(|e| format!(" ✻{}", e.label()))
+                .map(|e| format!(" · {} thinking", e.label()))
                 .unwrap_or_default();
             format!(" · {name}{effort}")
         } else {
@@ -3644,7 +4354,7 @@ impl Chat {
         let context = match viewed.and_then(|doc| self.context.get(&doc).copied()) {
             Some(share) => {
                 let shown = self.motions.follow(Anim::Context, share, Spring::COUNT);
-                format!(" · ctx {:.0}%", shown * 100.0)
+                format!(" · context {:.0}% used", shown * 100.0)
             }
             None => String::new(),
         };
@@ -3962,6 +4672,118 @@ mod tests {
             "last lines only: {rows:#?}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_empty_session_welcomes_and_explains() {
+        let (chat, dir) = super::motion_tests::chat_in_dir();
+        let mut chat = chat.with_reduced_motion(true);
+        let frame = chat.frame(80, 24);
+        let welcome = frame.welcome.expect("an empty session shows a welcome");
+        assert_eq!(welcome.starters.len(), 3);
+        assert!(!welcome.folder.is_empty());
+        let text: Vec<String> = frame
+            .rows
+            .iter()
+            .map(|r| r.iter().map(|run| run.text.as_str()).collect())
+            .collect();
+        assert!(
+            text.iter().any(|row| row.starts_with("Working in")),
+            "terminal gets it as rows: {text:#?}"
+        );
+        assert!(text.iter().any(|row| row.contains("f1 lists every key")));
+        // A starter becomes the prompt; once there is a turn, no welcome.
+        chat.use_starter(1);
+        assert_eq!(chat.editor.text(), "Find and fix a failing test");
+        chat.dispatch(one_turn());
+        assert!(chat.frame(80, 24).welcome.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn one_turn() -> shroom_core::Action {
+        shroom_core::Action::Append(format!("{}an answer\n\n", crate::user_turn("hi")))
+    }
+
+    #[test]
+    fn f1_lists_keys_and_symbols_and_ctrl_k_saves_a_key() {
+        let (chat, dir) = super::motion_tests::chat_in_dir();
+        let mut chat = chat.with_reduced_motion(true);
+        chat.key(super::Key::F(1), super::Mods::default());
+        assert_eq!(chat.pick, super::Pick::Help);
+        let labels: Vec<String> = chat
+            .picker
+            .matches()
+            .iter()
+            .map(|item| item.label.clone())
+            .collect();
+        assert!(labels.iter().any(|l| l.starts_with("Rewind")), "{labels:?}");
+        assert!(
+            labels.iter().any(|l| l.contains("✎ files")),
+            "symbols explained"
+        );
+        chat.key(super::Key::Esc, super::Mods::default());
+        // ctrl+k: the key field, shown as dots, saved to keys.env (0600).
+        let ctrl = super::Mods {
+            ctrl: true,
+            ..super::Mods::default()
+        };
+        chat.key(super::Key::Char('k'), ctrl);
+        assert_eq!(chat.pick, super::Pick::Key);
+        let name = chat.entering_key.clone().expect("a variable to set");
+        chat.paste("sk-test-123");
+        let popup = chat.frame(80, 24).popup.expect("the field is open");
+        let field = popup.field.expect("a text field").0;
+        assert!(!field.contains("sk-test"), "never shown: {field}");
+        chat.key(super::Key::Enter, super::Mods::default());
+        let saved = std::fs::read_to_string(dir.join("keys.env")).unwrap();
+        assert!(saved.contains(&format!("{name}=sk-test-123")), "{saved}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("keys.env"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "only the user can read it");
+        }
+        assert_eq!(std::env::var(&name).unwrap(), "sk-test-123");
+        // SAFETY: test-only, this variable is not read elsewhere.
+        unsafe { std::env::remove_var(&name) };
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn files_changed_line_and_plain_words() {
+        let line = super::changes_line(&[
+            "src/a.rs".into(),
+            "src/b.rs".into(),
+            "c".into(),
+            "d".into(),
+            "e".into(),
+        ]);
+        assert_eq!(
+            line,
+            "✎ 5 files changed\tsrc/a.rs, src/b.rs, c, d +1 more\n"
+        );
+        let lines = crate::answer_lines(&line);
+        let laid = crate::layout::turn_rows(&lines, 80, None, crate::layout::Fold::all(), false);
+        let text: String = laid.rows[0].iter().map(|run| run.text.as_str()).collect();
+        assert!(text.starts_with("✎ 5 files changed · src/a.rs"), "{text}");
+        assert!(
+            super::history(&[line.trim_end().to_string()]).is_empty(),
+            "never sent to the model"
+        );
+        // An image a program read stays with its run: one summary row.
+        let body = "⏵ Look\t1 call · 0.1s\n⎿ ✓\tread\tshot.png\t\n▣ [Image #1] shot.png\t/tmp/x.png\n✻ thinking more\n⏵ Again\t1 call · 0.1s\n⎿ ✓\tread\tb\t\nanswer\n";
+        let lines = crate::answer_lines(body);
+        let laid =
+            crate::layout::turn_rows(&lines, 80, None, crate::layout::Fold::default(), false);
+        let summaries = laid
+            .rows
+            .iter()
+            .filter(|row| row.first().is_some_and(|run| run.text == "▸ "))
+            .count();
+        assert_eq!(summaries, 1, "one folded run, not two");
     }
 
     #[test]
@@ -4537,6 +5359,41 @@ mod motion_tests {
     }
 
     #[test]
+    fn the_sidebar_glides_open_and_shut() {
+        let (chat, dir) = chat();
+        let mut chat = chat.with_pixels();
+        let mut t = Instant::now();
+        let open = |chat: &mut Chat, t: Instant| {
+            chat.frame_at(COLS, ROWS, t)
+                .chrome
+                .expect("pixel frames carry chrome")
+                .sidebar
+        };
+        assert_eq!(open(&mut chat, t), 1.0, "shown at start");
+        chat.key(
+            Key::Char('b'),
+            Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+        );
+        let mut shown = Vec::new();
+        for _ in 0..40 {
+            t += FRAME;
+            shown.push(open(&mut chat, t));
+        }
+        assert!(shown[0] > 0.8, "starts from open: {shown:?}");
+        assert!(
+            shown.windows(2).all(|w| w[1] <= w[0] + 1e-6),
+            "monotonic: {shown:?}"
+        );
+        let settled = shown.iter().position(|v| *v < 0.01).expect("closes");
+        assert!(settled * 16 < 320, "settles in {} ms", settled * 16);
+        assert_eq!(*shown.last().unwrap(), 0.0, "ends exactly hidden");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn switching_sessions_fades_the_transcript_in() {
         let (mut chat, dir) = chat();
         chat.dispatch(Action::Append("first session text\n".into()));
@@ -4691,7 +5548,7 @@ mod motion_tests {
                 .iter()
                 .map(|r| r.text.as_str())
                 .collect();
-            let at = status.find("ctx ").expect(&status) + 4;
+            let at = status.find("context ").expect(&status) + 8;
             let percent: u32 = status[at..].split('%').next().unwrap().parse().unwrap();
             shown.push(percent);
         }
@@ -4990,12 +5847,17 @@ mod key_tests {
         );
         let b = entry("GLM 5", "zai", 128_000, false, false);
         let compaction = vec![b.key()];
-        let labels = super::model_labels(&[&a, &b], &compaction);
+        let (labels, header) = super::model_labels(&[&a, &b], &compaction);
+        use unicode_width::UnicodeWidthStr;
+        assert_eq!(
+            header.width(),
+            labels[0].split_once('\t').unwrap().1.width(),
+            "column names line up with the columns: {header:?}"
+        );
         let hints: Vec<&str> = labels
             .iter()
             .map(|label| label.split_once('\t').unwrap().1)
             .collect();
-        use unicode_width::UnicodeWidthStr;
         assert_eq!(
             hints[0].width(),
             hints[1].width(),
@@ -5012,7 +5874,7 @@ mod key_tests {
             .enumerate()
             .map(|(i, l)| (i, l.clone(), false))
             .collect();
-        let popup = crate::popup::picker("models".into(), "", &items, 56, 2, 0);
+        let popup = crate::popup::picker("models".into(), "", &items, 64, 2, 0);
         let row: String = popup.rows[1].iter().map(|run| run.text.as_str()).collect();
         assert!(row.contains('…') && row.contains("✻ ▣"), "{row:?}");
     }

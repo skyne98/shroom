@@ -28,8 +28,11 @@ pub struct Theme {
     pub accent: u32,
     /// Inline code.
     pub code: u32,
-    /// Line numbers, separators: present but quiet.
+    /// Rules, borders, scrollbar thumbs: never text (2.99:1 on bg).
     pub faint: u32,
+    /// Secondary text that must stay readable on bg and surface (WCAG AA,
+    /// 4.5:1 on both): metadata, shortcut columns, line numbers.
+    pub muted: u32,
     /// Selected text background.
     pub select: u32,
     /// Failures: red glyphs, error lines.
@@ -47,6 +50,7 @@ pub const NIGHT: Theme = Theme {
     accent: 0x7ec48c,
     code: 0xd6ba82,
     faint: 0x5c6070,
+    muted: 0x8c8f9c,
     agent: 0xb48ef0,
     select: 0x3b4766,
     error: 0xf07882,
@@ -67,7 +71,7 @@ pub fn hints(mode: Mode, typing: bool, generating: bool) -> &'static str {
         Mode::Chat if generating && typing => "enter steer · shift+enter newline · esc clear",
         Mode::Chat if generating => "type to steer · esc stop · ctrl+o details",
         Mode::Chat if typing => "enter send · shift+enter newline · esc clear",
-        Mode::Chat => "ctrl+p commands · ctrl+s sessions · ctrl+l model · ctrl+o details",
+        Mode::Chat => "ctrl+p commands · ctrl+s sessions · ctrl+l model · f1 help",
     }
 }
 
@@ -151,6 +155,8 @@ pub enum Role {
     Agent,
     /// An image sent with a prompt: `label\tpath` (`[Image #1] shot.png · 640×480`).
     Image,
+    /// Files the turn changed: `summary\tpath, path, …`.
+    Changes,
 }
 
 /// Stored-body prefixes of the non-text parts of an answer. Answer text has
@@ -162,6 +168,7 @@ pub const CALL: &str = "⎿ ";
 pub const FAIL: &str = "⚠ ";
 pub const AGENT: &str = "◆ ";
 pub const IMAGE: &str = "▣ ";
+pub const CHANGES: &str = "✎ ";
 
 fn classify(line: &str) -> Line {
     for (prefix, role) in [
@@ -171,6 +178,7 @@ fn classify(line: &str) -> Line {
         (FAIL, Role::Fail),
         (AGENT, Role::Agent),
         (IMAGE, Role::Image),
+        (CHANGES, Role::Changes),
     ] {
         if let Some(text) = line.strip_prefix(prefix) {
             return Line {
@@ -537,9 +545,49 @@ impl Picker {
     }
 }
 
+/// WCAG contrast ratio of two `0xRRGGBB` colours (1..21).
+pub fn contrast(a: u32, b: u32) -> f64 {
+    let luminance = |rgb: u32| {
+        let channel = |shift: u32| {
+            let c = f64::from((rgb >> shift) & 0xff) / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+    };
+    let (x, y) = (luminance(a), luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Item, Picker, fuzzy};
+    use super::{Item, NIGHT, Picker, contrast, fuzzy};
+
+    #[test]
+    fn every_text_colour_is_readable_on_every_background() {
+        let texts = [
+            ("text", NIGHT.text),
+            ("dim", NIGHT.dim),
+            ("muted", NIGHT.muted),
+            ("accent", NIGHT.accent),
+            ("code", NIGHT.code),
+            ("agent", NIGHT.agent),
+            ("error", NIGHT.error),
+        ];
+        for (name, colour) in texts {
+            for (on, bg) in [("bg", NIGHT.bg), ("surface", NIGHT.surface)] {
+                let ratio = contrast(colour, bg);
+                assert!(ratio >= 4.5, "{name} on {on}: {ratio:.2} < 4.5 (WCAG AA)");
+            }
+        }
+        assert!(
+            contrast(NIGHT.faint, NIGHT.bg) < 4.5,
+            "faint is for rules only"
+        );
+    }
 
     #[test]
     fn fuzzy_finds_subsequences_and_ranks_sensibly() {

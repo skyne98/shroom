@@ -50,6 +50,8 @@ rustPlatform.buildRustPackage {
       ../Cargo.toml
       ../Cargo.lock
       ../crates
+      # The window embeds the mark (sidebar, empty session).
+      ./icons
     ];
   };
 

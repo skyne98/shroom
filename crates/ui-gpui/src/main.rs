@@ -1,6 +1,8 @@
 //! gpui client: translates gpui key/scroll events into `shroom_ui::chat::Key`
-//! and paints the rows `Chat::frame` lays out, in a monospace grid. All
-//! behaviour lives in shroom-ui, shared with the terminal client.
+//! and paints what `Chat::frame` lays out. All behaviour lives in shroom-ui,
+//! shared with the terminal client; this file is the desktop look: a session
+//! sidebar, a header, prose in a proportional font, cards behind prompts and
+//! code, a composer card with a send button, and real dialogs.
 
 use std::ops::Range;
 use std::time::Duration;
@@ -14,16 +16,33 @@ use gpui::{
 };
 use gpui_platform::application;
 use shroom_ui::NIGHT;
-use shroom_ui::chat::{Chat, Cursor, Key, Mods, Outcome};
-use shroom_ui::layout::{self, Bar, Paint, Row};
+use shroom_ui::chat::{Chat, Chrome, Cursor, Frame, Key, Mods, Outcome, Welcome};
+use shroom_ui::layout::{self, Bar, Face, Paint, Panel, Row};
 use shroom_ui::popup::Popup;
 
 const FONT: &str = "JetBrainsMono Nerd Font";
+/// Prose, chrome and dialogs: Inter, bundled (OFL) as "Shroom Sans".
+const SANS: &str = "Shroom Sans";
 /// Base metrics at zoom 1; everything scales with `Root::zoom`.
 const FONT_SIZE: f32 = 14.;
-const LINE_HEIGHT: f32 = 20.;
+/// Prose a touch larger than code, as in every editor's markdown preview.
+const SANS_SIZE: f32 = 14.5;
+const LINE_HEIGHT: f32 = 21.;
 const PAD: f32 = 16.;
 const ZOOM_STEP: f32 = 1.1;
+/// Chrome sizes at zoom 1, in px.
+const SIDEBAR: f32 = 248.;
+const HEADER: f32 = 44.;
+const FOOTER: f32 = 28.;
+/// Composer card padding around its text rows.
+const COMPOSER_PAD: f32 = 12.;
+/// Window background a shade darker than the content: the sidebar and the
+/// composer read as surfaces on it.
+const SHELL: u32 = 0x0d0e14;
+/// Hairlines between regions.
+const LINE: u32 = 0x23252f;
+/// Hovered rows and buttons.
+const HOVER: u32 = 0x1c1e29;
 
 struct Root {
     chat: Chat,
@@ -32,7 +51,48 @@ struct Root {
     base_cell: Pixels,
     /// ctrl+= / ctrl+- / ctrl+0; saved across runs.
     zoom: f32,
+    /// Where the content grid's first cell is in the window (px), set each
+    /// frame: clicks map through it.
+    origin: (f32, f32),
+    /// The window title last set.
+    title: String,
+    /// Sidebar openness of the last frame (0..1).
+    sidebar: f32,
+    /// Last frame's layout, for clicks: sidebar width, chrome edges (px),
+    /// the transcript+dock rows, where the composer's rows start (px) and
+    /// their first screen row.
+    hit_area: HitArea,
+    /// Answering (the composer's button is stop).
+    generating: bool,
+    /// Proportional glyph advances, at zoom 1 in cells, by (face, bold).
+    advances: Advances,
     _tick: Task<()>,
+}
+
+type Advances = std::rc::Rc<std::cell::RefCell<std::collections::HashMap<(Face, bool, char), f32>>>;
+/// A screen row with its click zones.
+type ZonedRow = (Row, Vec<(Range<usize>, Cursor)>);
+
+#[derive(Clone, Copy, Default)]
+struct HitArea {
+    left: f32,
+    top: f32,
+    bottom: f32,
+    /// Screen rows above the composer (transcript and dock).
+    above: usize,
+    composer: (f32, f32),
+    first_input: usize,
+    last_input: usize,
+    column_start: usize,
+}
+
+/// The desktop's "reduce animations" switch (GNOME/GTK setting, also read
+/// by most other desktops through it).
+fn os_reduced_motion() -> bool {
+    std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "enable-animations"])
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "false")
 }
 
 /// The zoom level kept in the data dir (one number).
@@ -108,6 +168,15 @@ impl Root {
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let text = window.text_system();
+        let _ = text.add_fonts(vec![
+            std::borrow::Cow::Borrowed(
+                include_bytes!("../fonts/ShroomSans-Regular.ttf").as_slice(),
+            ),
+            std::borrow::Cow::Borrowed(
+                include_bytes!("../fonts/ShroomSans-SemiBold.ttf").as_slice(),
+            ),
+            std::borrow::Cow::Borrowed(include_bytes!("../fonts/ShroomSans-Italic.ttf").as_slice()),
+        ]);
         let id = text.resolve_font(&font(FONT));
         let base_cell = text
             .advance(id, px(FONT_SIZE), 'm')
@@ -131,18 +200,53 @@ impl Root {
                 }
             }
         });
-        let chat = Chat::open()
+        let mut chat = Chat::open()
             .with_mouse()
             .with_pixels()
+            .with_column(96)
             .with_startup_prompt();
+        if os_reduced_motion() {
+            chat = chat.with_reduced_motion(true);
+        }
         let zoom = load_zoom(chat.data_dir());
         Self {
             chat,
             focus: cx.focus_handle(),
             base_cell,
             zoom,
+            origin: (0., 0.),
+            title: String::new(),
+            sidebar: 1.,
+            generating: false,
+            hit_area: HitArea::default(),
+            advances: Default::default(),
             _tick: tick,
         }
+    }
+
+    /// The layout's measure for proportional prose: glyph advances of the
+    /// bundled sans in cells, cached per glyph.
+    fn measure(&self, window: &Window) -> layout::Measure {
+        let text = window.text_system().clone();
+        let cell = f32::from(self.base_cell);
+        let cache = self.advances.clone();
+        std::rc::Rc::new(move |run: &str, face: Face, bold: bool| {
+            let mut cache = cache.borrow_mut();
+            let mut total = 0.0;
+            for ch in run.chars() {
+                let width = *cache.entry((face, bold, ch)).or_insert_with(|| {
+                    let mut f = font(SANS);
+                    if bold {
+                        f.weight = FontWeight::BOLD;
+                    }
+                    let id = text.resolve_font(&f);
+                    text.advance(id, px(sans_size(face)), ch)
+                        .map_or(0.6, |size| f32::from(size.width) / cell)
+                });
+                total += width;
+            }
+            total
+        })
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -208,14 +312,39 @@ impl Root {
     }
 
     /// Window position → grid cell of the last frame.
-    fn cell_at(&self, x: Pixels, y: Pixels) -> (usize, usize) {
-        let col = ((f32::from(x) - self.pad()) / f32::from(self.cell())).max(0.) as usize;
-        let row = ((f32::from(y) - self.pad()) / self.line()).max(0.) as usize;
-        (row, col)
+    /// Window position → grid cell of the last frame: transcript rows from
+    /// the grid origin, prompt rows from the composer card's. None outside
+    /// the chat (sidebar, header, footer).
+    fn cell_at(&self, x: Pixels, y: Pixels) -> Option<(usize, usize)> {
+        let (x, y) = (f32::from(x), f32::from(y));
+        let area = self.hit_area;
+        if x < area.left || y < area.top || y > area.bottom {
+            return None;
+        }
+        let (cell, line) = (f32::from(self.cell()), self.line());
+        if y >= area.composer.1 {
+            // The card shows the row from the column's start; the chat counts
+            // cells from window column 0.
+            let col = ((x - area.composer.0) / cell).max(0.) as usize + area.column_start;
+            let row = area.first_input + ((y - area.composer.1) / line).max(0.) as usize;
+            return Some((row, col));
+        }
+        let col = ((x - self.origin.0) / cell).max(0.) as usize;
+        let row = (((y - self.origin.1) / line).max(0.) as usize).min(area.above.saturating_sub(1));
+        Some((row, col))
     }
 
-    fn on_click(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let (row, col) = self.cell_at(event.position.x, event.position.y);
+    fn on_click(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // In the composer: the byte under the pointer in proportional text.
+        if let Some((row, at)) = self.text_at(event.position.x, event.position.y, window) {
+            self.chat
+                .click_text(row, at, event.click_count, event.modifiers.shift);
+            cx.notify();
+            return;
+        }
+        let Some((row, col)) = self.cell_at(event.position.x, event.position.y) else {
+            return;
+        };
         let mods = Mods {
             ctrl: event.modifiers.control,
             shift: event.modifiers.shift,
@@ -226,13 +355,46 @@ impl Root {
         cx.notify();
     }
 
-    fn on_drag(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if event.pressed_button == Some(MouseButton::Left) {
-            let (row, col) = self.cell_at(event.position.x, event.position.y);
-            if self.chat.drag(row, col) {
-                cx.notify();
-            }
+    fn on_drag(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            return;
         }
+        let changed = match self.text_at(event.position.x, event.position.y, window) {
+            Some((row, at)) => self.chat.drag_text(row, at),
+            None => match self.cell_at(event.position.x, event.position.y) {
+                Some((row, col)) => self.chat.drag(row, col),
+                None => false,
+            },
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Screen row and byte offset (within that row's text) under a point in
+    /// the composer, measured with the sans glyph advances.
+    fn text_at(&self, x: Pixels, y: Pixels, window: &Window) -> Option<(usize, usize)> {
+        let (x, y) = (f32::from(x), f32::from(y));
+        let area = self.hit_area;
+        if y < area.composer.1 || y > area.bottom || x < area.left {
+            return None;
+        }
+        let row = area.first_input + ((y - area.composer.1) / self.line()).max(0.) as usize;
+        let row = row.min(area.last_input);
+        let (start, end) = self.chat.input_span(row)?;
+        let text = &self.chat.input_text()[start..end];
+        let measure = self.measure(window);
+        let cell = f32::from(self.cell());
+        // The window's prompt rows have no marker: text starts at the edge.
+        let mut left = area.composer.0;
+        for (at, ch) in text.char_indices() {
+            let width = measure(ch.encode_utf8(&mut [0; 4]), Face::Sans, false) * cell;
+            if x < left + width / 2. {
+                return Some((row, at));
+            }
+            left += width;
+        }
+        Some((row, text.len()))
     }
 
     /// Selecting text puts it on the primary selection (middle-click paste),
@@ -269,6 +431,7 @@ struct Metrics {
     cell: Pixels,
     line: f32,
     pad: f32,
+    zoom: f32,
 }
 
 fn color(value: u32) -> Hsla {
@@ -294,9 +457,13 @@ fn row(cells: Row, zones: &[(Range<usize>, Cursor)], m: Metrics) -> impl IntoEle
     if col < total {
         parts.push((col..total, Cursor::Default));
     }
-    let line = div().h(px(m.line)).whitespace_nowrap().flex();
+    let line = div()
+        .h(px(m.line))
+        .whitespace_nowrap()
+        .flex()
+        .items_center();
     if parts.is_empty() {
-        return line.child(styled(cells));
+        return line.children(sized(cells, m));
     }
     let last = parts.len() - 1;
     line.children(parts.into_iter().enumerate().map(|(n, (range, cursor))| {
@@ -308,8 +475,68 @@ fn row(cells: Row, zones: &[(Range<usize>, Cursor)], m: Metrics) -> impl IntoEle
             .when(n == last, |part| part.flex_1())
             .when(cursor == Cursor::Pointer, |part| part.cursor_pointer())
             .when(cursor == Cursor::Text, |part| part.cursor_text())
-            .child(styled(layout::slice(&cells, range)))
+            .flex()
+            .items_center()
+            .children(sized(layout::slice(&cells, range), m))
     }))
+}
+
+/// A prompt row: its runs as text, with the caret run drawn as a thin bar
+/// in front of the character it sits on (a native text field's caret).
+fn composer_row(cells: Row, m: Metrics) -> gpui::AnyElement {
+    let caret = layout::CARET.sans();
+    let at = cells.iter().position(|run| run.paint == caret);
+    let line = div()
+        .h(px(m.line))
+        .whitespace_nowrap()
+        .flex()
+        .items_center()
+        .cursor_text();
+    let Some(at) = at else {
+        return line.children(sized(cells, m)).into_any_element();
+    };
+    let (before, after) = cells.split_at(at);
+    line.children(sized(before.to_vec(), m))
+        .child(
+            div()
+                .flex_none()
+                .w(px(2.))
+                .h(px(m.line * 0.8))
+                .rounded_full()
+                .bg(color(NIGHT.accent)),
+        )
+        .children(sized(after.to_vec(), m))
+        .into_any_element()
+}
+
+/// A row's runs grouped by text size (headings are larger), each group one
+/// shaped text, so sizes mix on one line.
+fn sized(cells: Row, m: Metrics) -> Vec<gpui::AnyElement> {
+    let size = |paint: &Paint| match paint.face {
+        Face::Mono => FONT_SIZE,
+        face => sans_size(face),
+    };
+    let mut groups: Vec<(f32, Row)> = Vec::new();
+    for cell in cells {
+        let s = size(&cell.paint);
+        match groups.last_mut() {
+            Some((at, row)) if *at == s => row.push(cell),
+            _ => groups.push((s, vec![cell])),
+        }
+    }
+    if groups.is_empty() {
+        groups.push((FONT_SIZE, Row::new()));
+    }
+    groups
+        .into_iter()
+        .map(|(size, row)| {
+            div()
+                .flex_none()
+                .text_size(px(size * m.zoom))
+                .child(styled(row))
+                .into_any_element()
+        })
+        .collect()
 }
 
 fn styled(cells: Row) -> StyledText {
@@ -329,7 +556,26 @@ fn styled(cells: Row) -> StyledText {
     StyledText::new(SharedString::from(text)).with_runs(runs)
 }
 
+/// Prose size per face at zoom 1.
+fn sans_size(face: Face) -> f32 {
+    match face {
+        Face::Title(1) => 20.,
+        Face::Title(2) => 17.,
+        Face::Title(_) => 15.5,
+        _ => SANS_SIZE,
+    }
+}
+
 fn text_run(text: &str, paint: Paint) -> TextRun {
+    // Cards draw prompt and code backgrounds; the cells keep only marks
+    // that are not panel fill (selection, inline highlights). The caret is
+    // drawn as a bar by `caret_bar`, not as a filled glyph.
+    let caret = paint == layout::CARET.sans();
+    let background = paint
+        .bg
+        .filter(|bg| *bg != NIGHT.surface && !caret)
+        .map(color);
+    let paint = if caret { layout::TEXT.sans() } else { paint };
     TextRun {
         len: text.len(),
         font: Font {
@@ -343,10 +589,10 @@ fn text_run(text: &str, paint: Paint) -> TextRun {
             } else {
                 FontStyle::Normal
             },
-            ..font(FONT)
+            ..font(if paint.face == Face::Mono { FONT } else { SANS })
         },
         color: color(paint.fg),
-        background_color: paint.bg.map(color),
+        background_color: background,
         underline: paint.underline.then(|| UnderlineStyle {
             thickness: px(1.),
             color: Some(color(paint.fg)),
@@ -381,7 +627,7 @@ fn picture(shown: &shroom_ui::chat::Shown, shift: Pixels, m: Metrics) -> impl In
 /// to a full track and thumb. Its hover area is the whole cell column, so
 /// it is easy to find; clicks still land on the grid underneath.
 fn scrollbar(bar: Bar, m: Metrics, cx: &mut Context<Root>) -> gpui::AnyElement {
-    scrollbar_at(bar, m, (m.pad, m.pad), cx)
+    scrollbar_at(bar, m, (m.pad, m.pad / 2.), cx)
 }
 
 /// A scrollbar on a grid whose first cell is at `origin` (px) in its parent.
@@ -435,90 +681,726 @@ fn scrollbar_at(
         .into_any_element()
 }
 
-/// Any popup: centered bordered overlay; rows painted like the main grid,
-/// item rows clickable with hover. Clicks inside never reach the grid.
+/// A dialog: a centered card over a dimmed window, title, a real text
+/// field, then the items as rows with proportional names and flush-right
+/// hints. Clicks inside never reach the chat; a click on the dimmed backdrop
+/// closes it (the chat does that for clicks outside).
 fn popup(view: Popup, m: Metrics, cx: &mut Context<Root>) -> impl IntoElement {
-    let cell = m.cell;
-    let row_width = cell * view.width as f32;
-    let open = view.open.clamp(0.0, 1.0);
-    // Border and title arrive with the rows; the box grows to its width with
-    // the spring (overshoot included), so it visibly pops.
-    let border = shroom_ui::motion::mix(NIGHT.bg, NIGHT.dim, open);
-    let grow = (0.92 + 0.08 * view.open) as f32;
-    // Its rows start under the title line; its column is past the rows, so
-    // shift the origin to center the 6 px bar in the right padding.
-    let edge = m.pad + (m.pad - f32::from(m.cell)) / 2.;
-    let bar = match view.bar {
-        Some(bar) => Some(scrollbar_at(bar, m, (edge, m.pad / 2. + m.line), cx)),
-        None => None,
-    };
+    let open = view.open.clamp(0.0, 1.0) as f32;
+    let grow = (0.96 + 0.04 * view.open) as f32;
+    let row_h = (m.line * 1.5).round();
+    let width = (f32::from(m.cell) * view.width as f32 + 32. * m.zoom).max(360. * m.zoom) * grow;
     let (window, shift) = (view.window, view.shift);
-    let mut rows = view
-        .rows
+    let selected = view.selected;
+    let rows: Vec<_> = view
+        .labels
         .into_iter()
         .zip(view.items)
         .enumerate()
-        .map(|(n, (cells, item))| {
-            // Exactly the row's cells wide: hover and selection bands match.
+        .skip(1)
+        .map(|(n, (label, item))| {
+            let (name, hint) = label.unwrap_or_default();
+            let chosen = selected == Some(n);
             let line = div()
-                .id(("popup-row", n))
-                .w(row_width)
-                .child(row(cells, &[], m));
+                .id(("dialog-row", n))
+                .role(gpui::Role::ListBoxOption)
+                .aria_label(SharedString::from(format!("{name} {hint}")))
+                .aria_selected(chosen)
+                .h(px(row_h))
+                .ml(px(6. * m.zoom))
+                .mr(px(12. * m.zoom))
+                .px(px(10. * m.zoom))
+                .rounded(px(6. * m.zoom))
+                .flex()
+                .items_center()
+                .gap(px(12. * m.zoom))
+                .when(chosen, |row| row.bg(color(NIGHT.select)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .font_family(SANS)
+                        .text_size(px(SANS_SIZE * m.zoom))
+                        .text_color(color(NIGHT.text))
+                        .when(chosen, |name| name.font_weight(FontWeight::BOLD))
+                        .child(SharedString::from(name)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .font_family(FONT)
+                        .text_size(px(11.5 * m.zoom))
+                        .text_color(color(if chosen { NIGHT.text } else { NIGHT.muted }))
+                        .child(SharedString::from(hint)),
+                );
             match item {
                 Some(index) => line
                     .cursor_pointer()
-                    .hover(|style| style.bg(color(NIGHT.surface)))
+                    .when(!chosen, |row| row.hover(|style| style.bg(color(HOVER))))
                     .on_click(cx.listener(move |root, _, _, cx| {
                         let outcome = root.chat.pick(index);
                         root.apply(outcome, cx);
                         cx.notify();
-                    })),
-                None => line,
+                    }))
+                    .into_any_element(),
+                None => line.into_any_element(),
             }
-        });
-    // The filter row stays; the items scroll in a clipped box under it.
-    let field = rows.next();
-    let items = div().h(px(window as f32 * m.line)).overflow_hidden().child(
+        })
+        .collect();
+    let field = view.field.map(|(text, placeholder)| {
+        let empty = text.is_empty();
+        div()
+            .id("dialog-field")
+            .role(gpui::Role::TextInput)
+            .aria_label(SharedString::from(view.title.clone()))
+            .aria_placeholder(SharedString::from(placeholder.clone()))
+            .mx(px(12. * m.zoom))
+            .mb(px(8. * m.zoom))
+            .h(px(row_h + 4. * m.zoom))
+            .px(px(10. * m.zoom))
+            .rounded(px(7. * m.zoom))
+            .bg(color(NIGHT.bg))
+            .border_1()
+            .border_color(color(NIGHT.accent))
+            .flex()
+            .items_center()
+            .font_family(SANS)
+            .text_size(px(SANS_SIZE * m.zoom))
+            .when(empty, |field| {
+                field.child(
+                    div()
+                        .w(px(2.))
+                        .h(px(m.line * 0.9))
+                        .mr(px(1.))
+                        .bg(color(NIGHT.accent)),
+                )
+            })
+            .child(
+                div()
+                    .text_color(color(if empty { NIGHT.dim } else { NIGHT.text }))
+                    .child(SharedString::from(if empty { placeholder } else { text })),
+            )
+            .when(!empty, |field| {
+                field.child(
+                    div()
+                        .w(px(2.))
+                        .h(px(m.line * 0.9))
+                        .ml(px(1.))
+                        .bg(color(NIGHT.accent)),
+                )
+            })
+    });
+    let header = view.header.map(|header| {
+        div()
+            .ml(px(16. * m.zoom))
+            .mr(px(22. * m.zoom))
+            .mb(px(2. * m.zoom))
+            .flex()
+            .justify_end()
+            .whitespace_nowrap()
+            .font_family(FONT)
+            .text_size(px(11.5 * m.zoom))
+            .text_color(color(NIGHT.dim))
+            .child(SharedString::from(header))
+    });
+    let has_rows = !rows.is_empty();
+    let list = div()
+        .id("dialog-list")
+        .role(gpui::Role::ListBox)
+        .h(px(window as f32 * row_h))
+        .overflow_hidden()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .mt(px(-shift * row_h))
+                .children(rows),
+        );
+    let bar = view.bar.map(|bar| {
+        let top = bar.thumb.start.saturating_sub(bar.rows.start) as f32 * row_h;
+        let len = bar.thumb.len() as f32 * row_h;
+        div()
+            .absolute()
+            .right(px(3. * m.zoom))
+            .top(px(top))
+            .w(px(4. * m.zoom))
+            .h(px(len))
+            .rounded_full()
+            .bg(color(NIGHT.faint))
+    });
+    div()
+        .absolute()
+        .inset_0()
+        // Black at 60%: the chat recedes, the dialog is the one thing to read.
+        .bg(gpui::rgba((0x99 as f32 * open) as u32))
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96. * m.zoom))
+        .child(
+            div()
+                .id("dialog")
+                .role(gpui::Role::Dialog)
+                .aria_label(SharedString::from(view.title.clone()))
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                // The box hides the window's own wheel handler: scroll here.
+                .on_scroll_wheel(cx.listener(Root::on_scroll))
+                .w(px(width))
+                .opacity(open)
+                .bg(color(NIGHT.surface))
+                .border_1()
+                .border_color(color(LINE))
+                .rounded(px(12. * m.zoom))
+                .shadow_lg()
+                .py(px(8. * m.zoom))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .px(px(16. * m.zoom))
+                        .pt(px(4. * m.zoom))
+                        .pb(px(10. * m.zoom))
+                        .font_family(SANS)
+                        .text_size(px(12.5 * m.zoom))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(color(NIGHT.dim))
+                        .child(SharedString::from(view.title)),
+                )
+                .children(field)
+                .children(header)
+                .when(has_rows, |card| {
+                    card.child(div().relative().child(list).children(bar))
+                }),
+        )
+}
+
+/// The left sidebar: product mark, new-session button, the sessions with
+/// their state, and the working folder at the bottom.
+fn sidebar(chrome: &Chrome, m: Metrics, width: f32, cx: &mut Context<Root>) -> gpui::AnyElement {
+    let z = m.zoom;
+    let mark = img(gpui::ImageSource::Image(std::sync::Arc::new(
+        gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            include_bytes!("../../../nix/icons/shroom-64.png").to_vec(),
+        ),
+    )))
+    .size(px(22. * z))
+    .rounded(px(5. * z));
+    let new = div()
+        .id("new-session")
+        .role(gpui::Role::Button)
+        .aria_label("New session")
+        .aria_keyshortcuts("Control+N")
+        .mx(px(10. * z))
+        .mb(px(8. * z))
+        .h(px(32. * z))
+        .px(px(10. * z))
+        .rounded(px(7. * z))
+        .border_1()
+        .border_color(color(LINE))
+        .flex()
+        .items_center()
+        .justify_between()
+        .cursor_pointer()
+        .hover(|style| style.bg(color(HOVER)))
+        .on_click(cx.listener(|root, _, _, cx| {
+            let outcome = root.chat.press("ctrl+n new");
+            root.apply(outcome, cx);
+            cx.notify();
+        }))
+        .child(div().text_color(color(NIGHT.text)).child("New session"))
+        .child(
+            div()
+                .font_family(FONT)
+                .text_size(px(11.5 * z))
+                .text_color(color(NIGHT.muted))
+                .child("ctrl+n"),
+        );
+    let sessions: Vec<_> = chrome
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(n, session)| {
+            let id = session.id;
+            let state_colour = match session.state.as_str() {
+                "answering" => NIGHT.accent,
+                "stopped" => NIGHT.error,
+                "" => NIGHT.muted,
+                _ => NIGHT.agent,
+            };
+            let detail = if session.state.is_empty() {
+                session.detail.clone()
+            } else {
+                format!("{} · {}", session.state, session.detail)
+            };
+            div()
+                .id(("session", n))
+                .role(gpui::Role::ListItem)
+                .aria_label(SharedString::from(format!("{}, {}", session.title, detail)))
+                .aria_selected(session.current)
+                .mx(px(6. * z))
+                .px(px(10. * z))
+                .py(px(6. * z))
+                .rounded(px(7. * z))
+                .cursor_pointer()
+                .when(session.current, |row| row.bg(color(NIGHT.surface)))
+                .when(!session.current, |row| {
+                    row.hover(|style| style.bg(color(HOVER)))
+                })
+                .on_click(cx.listener(move |root, _, _, cx| {
+                    root.chat.open_session(id);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_color(color(NIGHT.text))
+                        .when(session.current, |title| title.font_weight(FontWeight::BOLD))
+                        .child(SharedString::from(session.title.clone())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6. * z))
+                        .text_size(px(12. * z))
+                        .text_color(color(NIGHT.muted))
+                        .when(!session.state.is_empty(), |line| {
+                            line.child(
+                                div()
+                                    .size(px(6. * z))
+                                    .rounded_full()
+                                    .bg(color(state_colour)),
+                            )
+                        })
+                        .child(SharedString::from(detail)),
+                )
+                .into_any_element()
+        })
+        .collect();
+    div()
+        .id("sidebar")
+        .role(gpui::Role::Navigation)
+        .aria_label("Sessions")
+        .flex_none()
+        .w(px(width))
+        .h_full()
+        .overflow_hidden()
+        .bg(color(SHELL))
+        .border_r_1()
+        .border_color(color(LINE))
+        .flex()
+        .flex_col()
+        .font_family(SANS)
+        .text_size(px(13.5 * z))
+        .child(
+            div()
+                .h(px(HEADER * z))
+                .px(px(14. * z))
+                .flex()
+                .items_center()
+                .gap(px(8. * z))
+                .child(mark)
+                .child(
+                    div()
+                        .font_weight(FontWeight::BOLD)
+                        .text_size(px(15. * z))
+                        .text_color(color(NIGHT.text))
+                        .child("shroom"),
+                ),
+        )
+        .child(new)
+        .child(
+            div()
+                .px(px(16. * z))
+                .pt(px(4. * z))
+                .pb(px(4. * z))
+                .text_size(px(11.5 * z))
+                .font_weight(FontWeight::BOLD)
+                .text_color(color(NIGHT.muted))
+                .child("Sessions"),
+        )
+        .child(
+            div()
+                .id("session-list")
+                .flex_1()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(2. * z))
+                .children(sessions),
+        )
+        .child(
+            div()
+                .border_t_1()
+                .border_color(color(LINE))
+                .px(px(14. * z))
+                .py(px(10. * z))
+                .flex()
+                .flex_col()
+                .gap(px(2. * z))
+                .text_size(px(12. * z))
+                .child(div().text_color(color(NIGHT.muted)).child("Working in"))
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .font_family(FONT)
+                        .text_color(color(NIGHT.text))
+                        .child(SharedString::from(chrome.folder.clone())),
+                )
+                .when_some(chrome.branch.clone(), |box_, branch| {
+                    box_.child(
+                        div()
+                            .font_family(FONT)
+                            .text_color(color(NIGHT.dim))
+                            .child(SharedString::from(format!("⎇ {branch}"))),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
+/// A small pill button in the header (model, thinking): clicking runs a key.
+fn pill(
+    id: &'static str,
+    label: String,
+    keys: &'static str,
+    m: Metrics,
+    cx: &mut Context<Root>,
+) -> impl IntoElement {
+    let z = m.zoom;
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(SharedString::from(label.clone()))
+        .h(px(26. * z))
+        .px(px(10. * z))
+        .rounded(px(13. * z))
+        .border_1()
+        .border_color(color(LINE))
+        .flex()
+        .items_center()
+        .text_size(px(12.5 * z))
+        .text_color(color(NIGHT.text))
+        .cursor_pointer()
+        .hover(|style| style.bg(color(HOVER)))
+        .on_click(cx.listener(move |root, _, _, cx| {
+            let outcome = root.chat.press(keys);
+            root.apply(outcome, cx);
+            cx.notify();
+        }))
+        .child(SharedString::from(label))
+}
+
+/// The header over the chat: the session's name, then the model, thinking
+/// level and how full the context is, each a button.
+fn header(chrome: &Chrome, m: Metrics, cx: &mut Context<Root>) -> gpui::AnyElement {
+    let z = m.zoom;
+    let context = chrome.context.map(|share| {
+        let share = share.clamp(0.0, 1.0) as f32;
+        let tone = if share > 0.8 {
+            NIGHT.code
+        } else {
+            NIGHT.accent
+        };
+        div()
+            .id("context")
+            .role(gpui::Role::ProgressIndicator)
+            .aria_label(SharedString::from(format!(
+                "Context {:.0}% used",
+                share * 100.
+            )))
+            .flex()
+            .items_center()
+            .gap(px(6. * z))
+            .text_size(px(12. * z))
+            .text_color(color(NIGHT.muted))
+            .child(
+                div()
+                    .w(px(48. * z))
+                    .h(px(4. * z))
+                    .rounded_full()
+                    .bg(color(NIGHT.surface))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(px(48. * z * share))
+                            .rounded_full()
+                            .bg(color(tone)),
+                    ),
+            )
+            .child(SharedString::from(format!("{:.0}% context", share * 100.)))
+    });
+    div()
+        .id("header")
+        .role(gpui::Role::Banner)
+        .flex_none()
+        .h(px(HEADER * z))
+        .px(px(18. * z))
+        .border_b_1()
+        .border_color(color(LINE))
+        .flex()
+        .items_center()
+        .gap(px(10. * z))
+        .font_family(SANS)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_size(px(14. * z))
+                .font_weight(FontWeight::BOLD)
+                .text_color(color(NIGHT.text))
+                .child(SharedString::from(chrome.title.clone())),
+        )
+        .children(context)
+        .child(pill("model", chrome.model.clone(), "ctrl+l model", m, cx))
+        .when_some(chrome.thinking.clone(), |row, thinking| {
+            row.child(pill("thinking", thinking, "shift+tab thinking", m, cx))
+        })
+        .into_any_element()
+}
+
+/// The empty session: the mark, where the agent works, the model, three
+/// example tasks as buttons, and the one key to remember.
+fn welcome(info: &Welcome, m: Metrics, cx: &mut Context<Root>) -> impl IntoElement {
+    let z = m.zoom;
+    let mark = img(gpui::ImageSource::Image(std::sync::Arc::new(
+        gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            include_bytes!("../../../nix/icons/shroom-128.png").to_vec(),
+        ),
+    )))
+    .size(px(72. * z))
+    .rounded(px(16. * z));
+    let fact = |label: &str, value: String, mono: bool| {
         div()
             .flex()
-            .flex_col()
-            .mt(px(-shift * m.line))
-            .children(rows),
-    );
+            .gap(px(10. * z))
+            .child(
+                div()
+                    .w(px(84. * z))
+                    .text_color(color(NIGHT.muted))
+                    .child(SharedString::from(label.to_string())),
+            )
+            .child(
+                div()
+                    .when(mono, |value| value.font_family(FONT).text_size(px(13. * z)))
+                    .text_color(color(NIGHT.text))
+                    .child(SharedString::from(value)),
+            )
+    };
+    let starters: Vec<_> = info
+        .starters
+        .iter()
+        .enumerate()
+        .map(|(n, text)| {
+            div()
+                .id(("starter", n))
+                .role(gpui::Role::Button)
+                .aria_label(SharedString::from(text.clone()))
+                .px(px(14. * z))
+                .py(px(10. * z))
+                .rounded(px(9. * z))
+                .border_1()
+                .border_color(color(LINE))
+                .bg(color(SHELL))
+                .text_color(color(NIGHT.text))
+                .cursor_pointer()
+                .hover(|style| style.bg(color(HOVER)).border_color(color(NIGHT.faint)))
+                .on_click(cx.listener(move |root, _, _, cx| {
+                    root.chat.use_starter(n);
+                    cx.notify();
+                }))
+                .child(SharedString::from(text.clone()))
+                .into_any_element()
+        })
+        .collect();
     div()
         .absolute()
         .inset_0()
         .flex()
         .items_center()
         .justify_center()
+        .font_family(SANS)
+        .text_size(px(14.5 * z))
         .child(
             div()
-                .id("popup")
-                .occlude()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                // The box hides the window's own wheel handler: scroll here.
-                .on_scroll_wheel(cx.listener(Root::on_scroll))
-                .w((cell * view.width as f32 + px(2. * m.pad)) * grow)
-                .overflow_hidden()
-                .bg(color(NIGHT.bg))
-                .border_1()
-                .border_color(color(border))
-                .rounded_md()
-                .px(px(m.pad))
-                .py(px(m.pad / 2.))
+                .id("welcome")
+                .role(gpui::Role::Group)
+                .aria_label("New session")
+                .w(px(480. * z))
                 .flex()
                 .flex_col()
+                .gap(px(18. * z))
                 .child(
                     div()
                         .flex()
-                        .justify_center()
-                        .text_color(color(border))
-                        .child(SharedString::from(view.title)),
+                        .items_center()
+                        .gap(px(16. * z))
+                        .child(mark)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_size(px(22. * z))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(color(NIGHT.text))
+                                        .child("What should we work on?"),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(color(NIGHT.dim))
+                                        .child("shroom reads, runs and edits code in this folder."),
+                                ),
+                        ),
                 )
-                .children(field)
-                .child(items)
-                .children(bar),
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4. * z))
+                        .child(fact("Folder", info.folder.clone(), true))
+                        .when_some(info.branch.clone(), |facts, branch| facts.child(fact("Branch", branch, true)))
+                        .child(fact("Model", info.model.clone(), false))
+                        .when_some(info.missing_key.clone(), |facts, key| {
+                            facts.child(
+                                div()
+                                    .id("missing-key")
+                                    .role(gpui::Role::Button)
+                                    .mt(px(6. * z))
+                                    .px(px(12. * z))
+                                    .py(px(8. * z))
+                                    .rounded(px(8. * z))
+                                    .bg(color(0x2a2418))
+                                    .text_color(color(NIGHT.code))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|root, _, _, cx| {
+                                        let outcome = root.chat.press("ctrl+k key");
+                                        root.apply(outcome, cx);
+                                        cx.notify();
+                                    }))
+                                    .child(SharedString::from(format!(
+                                        "No API key for this model ({key}). Click or press ctrl+k to enter one."
+                                    ))),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8. * z))
+                        .child(div().text_size(px(12.5 * z)).text_color(color(NIGHT.muted)).child("Try"))
+                        .children(starters),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.5 * z))
+                        .text_color(color(NIGHT.muted))
+                        .child("F1 lists every key. Ctrl+P runs any command."),
+                ),
         )
+}
+
+/// The bottom line: key hints as clickable chips, or a notice.
+fn footer(chrome: &Chrome, m: Metrics, cx: &mut Context<Root>) -> gpui::AnyElement {
+    let z = m.zoom;
+    let body: gpui::AnyElement = match &chrome.notice {
+        Some((text, good, fade)) => div()
+            .id("notice")
+            .role(gpui::Role::Status)
+            .aria_label(SharedString::from(text.clone()))
+            .opacity(*fade)
+            .flex()
+            .items_center()
+            .gap(px(6. * z))
+            .text_color(color(if *good { NIGHT.accent } else { NIGHT.code }))
+            .when(*good, |line| line.child("✓"))
+            .child(SharedString::from(text.clone()))
+            .into_any_element(),
+        None => div()
+            .flex()
+            .items_center()
+            .gap(px(14. * z))
+            .children(chrome.hints.iter().enumerate().map(|(n, hint)| {
+                let (keys, what) = hint.split_once(' ').unwrap_or((hint.as_str(), ""));
+                let is_key = [
+                    "ctrl",
+                    "shift",
+                    "alt",
+                    "esc",
+                    "enter",
+                    "tab",
+                    "del",
+                    "f1",
+                    "f2",
+                    "↑",
+                    "backspace",
+                ]
+                .iter()
+                .any(|key| keys.starts_with(key));
+                let (keys, what) = if is_key {
+                    (keys, what)
+                } else {
+                    ("", hint.as_str())
+                };
+                let press = hint.clone();
+                div()
+                    .id(("hint", n))
+                    .role(gpui::Role::Button)
+                    .aria_label(SharedString::from(hint.clone()))
+                    .flex()
+                    .items_center()
+                    .gap(px(5. * z))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(color(NIGHT.text)))
+                    .on_click(cx.listener(move |root, _, _, cx| {
+                        let outcome = root.chat.press(&press);
+                        root.apply(outcome, cx);
+                        cx.notify();
+                    }))
+                    .when(!keys.is_empty(), |hint| {
+                        hint.child(
+                            div()
+                                .px(px(5. * z))
+                                .rounded(px(4. * z))
+                                .border_1()
+                                .border_color(color(LINE))
+                                .font_family(FONT)
+                                .text_size(px(11. * z))
+                                .text_color(color(NIGHT.dim))
+                                .child(SharedString::from(keys.to_string())),
+                        )
+                    })
+                    .child(SharedString::from(what.to_string()))
+            }))
+            .into_any_element(),
+    };
+    div()
+        .flex_none()
+        .h(px(FOOTER * z))
+        .px(px(18. * z))
+        .flex()
+        .items_center()
+        .font_family(SANS)
+        .text_size(px(12. * z))
+        .text_color(color(NIGHT.muted))
+        .child(body)
+        .into_any_element()
 }
 
 impl Render for Root {
@@ -526,55 +1408,106 @@ impl Render for Root {
         if !self.focus.is_focused(window) {
             window.focus(&self.focus, cx);
         }
-        // The window is a character grid: same cols × rows the terminal gets.
-        let viewport = window.viewport_size();
+        let z = self.zoom;
         let m = Metrics {
             cell: self.cell(),
             line: self.line(),
             pad: self.pad(),
+            zoom: z,
         };
-        let cols = (f32::from(viewport.width) - 2. * m.pad) / f32::from(m.cell);
-        let rows = (f32::from(viewport.height) - 2. * m.pad) / m.line;
-        let frame = self
-            .chat
-            .frame(cols.max(10.) as usize, rows.max(4.) as usize);
-
-        // The transcript scrolls by pixels: its rows sit `shift` rows lower,
-        // with the row above peeking in, clipped to the transcript area.
-        let mut rows: Vec<_> = frame.rows.into_iter().zip(frame.cursors).collect();
-        let below = rows.split_off(frame.viewport.min(rows.len()));
-        let shift = px(frame.shift * m.line);
-        // Real pictures over their half-block cells, in the same clip and
-        // the same smooth-scroll shift, so they move and fade with the text.
-        let pictures = frame
-            .pictures
-            .iter()
-            .filter(|shown| shown.picture.row < frame.viewport)
-            .map(|shown| picture(shown, shift, m));
-        let transcript = div()
-            .relative()
-            .h(px(frame.viewport as f32 * m.line))
-            .overflow_hidden()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .mt(shift - px(m.line))
-                    .child(row(frame.above.unwrap_or_default(), &[], m))
-                    .children(rows.into_iter().map(|(cells, zones)| row(cells, &zones, m))),
-            )
-            .children(pictures);
-
-        let mut bars = Vec::new();
-        for bar in frame.bars {
-            bars.push(scrollbar(bar, m, cx));
+        // Prose is measured in the bundled sans; it reads best at ~72
+        // characters, about 64 cells of the mono grid.
+        layout::set_style(layout::Style {
+            measure: Some(self.measure(window)),
+            prose: 64,
+        });
+        let viewport = window.viewport_size();
+        // The sidebar's width glides with its openness; on a narrow window
+        // it stays hidden.
+        let room = f32::from(viewport.width);
+        let wanted = self.chat_sidebar();
+        let sidebar_w = if room < 760. * z {
+            0.
+        } else {
+            SIDEBAR * z * wanted
+        };
+        let main_w = room - sidebar_w;
+        let columns = ((main_w - 2. * m.pad) / f32::from(m.cell)).max(10.);
+        // Header and footer are chrome; the rest is the chat's grid (the
+        // composer card adds its padding around the input rows).
+        let chrome_h = (HEADER + FOOTER) * z + 2. * COMPOSER_PAD * z;
+        let rows = ((f32::from(viewport.height) - chrome_h - m.pad) / m.line).max(4.);
+        let frame = self.chat.frame(columns as usize, rows as usize);
+        let chrome = frame.chrome.clone();
+        if let Some(chrome) = &chrome {
+            self.sidebar = chrome.sidebar;
+            self.generating = chrome.generating;
         }
+        if let Some(chrome) = &chrome {
+            let title = if chrome.title.is_empty() {
+                "shroom".to_string()
+            } else {
+                format!("{} · shroom", chrome.title)
+            };
+            if title != self.title {
+                window.set_window_title(&title);
+                self.title = title;
+            }
+        }
+        // Clicks map to grid cells from here: the transcript's first cell,
+        // and the composer's first text row (its card's border and padding).
+        self.origin = (sidebar_w + m.pad, HEADER * z + m.pad / 2.);
+        let above = frame.rule;
+        let first_input = frame.composer.start;
+        let chip_rows = usize::from(frame.chips.is_some());
+        let column = frame.column.clone();
+        self.hit_area = HitArea {
+            left: sidebar_w,
+            top: HEADER * z,
+            bottom: f32::from(viewport.height) - FOOTER * z,
+            above,
+            composer: (
+                sidebar_w + m.pad + f32::from(m.cell) * column.start as f32 + 1.,
+                self.origin.1
+                    + (above + frame.dock.len()) as f32 * m.line
+                    + 6. * z
+                    + 1.
+                    + COMPOSER_PAD * z * 0.75
+                    + chip_rows as f32 * m.line,
+            ),
+            first_input,
+            last_input: frame.composer.end.saturating_sub(1),
+            column_start: column.start,
+        };
+        let head = chrome.as_ref().map(|chrome| header(chrome, m, cx));
+        let body = chat_body(frame, m, self.generating, columns as usize, cx);
+        let foot = chrome.as_ref().map(|chrome| footer(chrome, m, cx));
+        let side = (sidebar_w > 1.)
+            .then(|| {
+                chrome
+                    .as_ref()
+                    .map(|chrome| sidebar(chrome, m, sidebar_w, cx))
+            })
+            .flatten();
+        let main = div()
+            .id("main")
+            .role(gpui::Role::Main)
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(color(NIGHT.bg))
+            .children(head)
+            .child(body)
+            .children(foot);
         div()
             .size_full()
-            .bg(color(NIGHT.bg))
-            .p(px(m.pad))
-            .font_family(FONT)
-            .text_size(px(FONT_SIZE * self.zoom))
+            .relative()
+            .flex()
+            .bg(color(SHELL))
+            .font_family(SANS)
+            .text_size(px(SANS_SIZE * z))
             .line_height(px(m.line))
             .text_color(color(NIGHT.text))
             .track_focus(&self.focus)
@@ -585,16 +1518,204 @@ impl Render for Root {
             .on_mouse_move(cx.listener(Self::on_drag))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_release))
             .on_drop(cx.listener(Self::on_drop))
-            .child(
-                div().flex().flex_col().child(transcript).children(
-                    below
-                        .into_iter()
-                        .map(|(cells, zones)| row(cells, &zones, m)),
-                ),
-            )
-            .children(bars)
-            .children(frame.popup.map(|view| popup(view, m, cx)))
+            .children(side)
+            .child(main)
     }
+}
+
+impl Root {
+    fn chat_sidebar(&mut self) -> f32 {
+        // Last frame's openness (the frame computes the glide).
+        self.sidebar
+    }
+}
+
+/// The chat area: transcript rows over their cards, the dock, then the
+/// composer card; pictures and scrollbars on top; dialogs over everything.
+fn chat_body(
+    frame: Frame,
+    m: Metrics,
+    generating: bool,
+    window_cols: usize,
+    cx: &mut Context<Root>,
+) -> gpui::AnyElement {
+    let z = m.zoom;
+    let Frame {
+        cards,
+        welcome: empty,
+        rows: all,
+        cursors,
+        viewport,
+        shift,
+        above,
+        bars,
+        popup: dialog,
+        pictures,
+        dock,
+        composer,
+        chips,
+        content,
+        column,
+        ..
+    } = frame;
+    let mut rows: Vec<_> = all.into_iter().zip(cursors).collect();
+    let mut below = rows.split_off(viewport.min(rows.len()));
+    let shift_px = px(shift * m.line);
+    let pictures = pictures
+        .iter()
+        .filter(|shown| shown.picture.row < viewport)
+        .map(|shown| picture(shown, shift_px, m))
+        .collect::<Vec<_>>();
+    let cards = cards.into_iter().map(|card| {
+        let top = card.top as f32 * m.line + f32::from(shift_px);
+        let (bg, radius) = match card.kind {
+            Panel::Prompt => (NIGHT.surface, 10.),
+            Panel::Code => (0x181a24, 8.),
+        };
+        div()
+            .absolute()
+            .left(m.cell * card.cols.start as f32 - px(10. * z))
+            .top(px(top - 6. * z))
+            .w(m.cell * card.cols.len() as f32 + px(20. * z))
+            .h(px(card.rows as f32 * m.line + 12. * z))
+            .rounded(px(radius * z))
+            .bg(color(bg))
+            .when(card.kind == Panel::Code, |code| {
+                code.border_1().border_color(color(LINE))
+            })
+            .opacity(card.fade * content)
+    });
+    let transcript = div()
+        .id("transcript")
+        .role(gpui::Role::Log)
+        .aria_label("Conversation")
+        .relative()
+        .h(px(viewport as f32 * m.line))
+        .overflow_hidden()
+        .children(cards)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .mt(shift_px - px(m.line))
+                .child(row(above.unwrap_or_default(), &[], m))
+                .children(rows.drain(..).map(|(cells, zones)| row(cells, &zones, m))),
+        )
+        .children(pictures)
+        .when_some(empty.filter(|_| dialog.is_none()), |area, info| {
+            area.child(welcome(&info, m, cx))
+        });
+    // Below the transcript: dock rows, then (skipping the old rule) the
+    // chips and the composer card; the old status row is the footer now.
+    let first = viewport;
+    let take = |range: Range<usize>, below: &mut Vec<ZonedRow>| {
+        range
+            .filter_map(|at| below.get(at - first).cloned())
+            .map(|(cells, zones)| row(cells, &zones, m))
+            .collect::<Vec<_>>()
+    };
+    let dock_rows = take(dock.clone(), &mut below);
+    // Chips and prompt rows: their cells from the column's start, inside
+    // the card (the grid centred them with leading spaces).
+    let inside = |range: Range<usize>, below: &Vec<ZonedRow>| {
+        range
+            .filter_map(|at| below.get(at - first).cloned())
+            .map(|(cells, _)| composer_row(layout::slice(&cells, column.start..usize::MAX), m))
+            .collect::<Vec<_>>()
+    };
+    let chip_rows = chips
+        .map(|at| inside(at..at + 1, &below))
+        .unwrap_or_default();
+    let input_rows = inside(composer.clone(), &below);
+
+    // The composer sits under the reading column, as wide as it.
+    let column_left = m.cell * column.start as f32;
+    let column_w = m.cell * column.len() as f32;
+    let composer_card = div()
+        .id("composer")
+        .role(gpui::Role::MultilineTextInput)
+        .aria_label("Message")
+        .ml(column_left - px(COMPOSER_PAD * z))
+        .w(column_w + px(2. * COMPOSER_PAD * z))
+        .mt(px(6. * z))
+        .px(px(COMPOSER_PAD * z))
+        .py(px(COMPOSER_PAD * z * 0.75))
+        .rounded(px(12. * z))
+        .bg(color(NIGHT.surface))
+        .border_1()
+        .border_color(color(LINE))
+        .flex()
+        .items_end()
+        .gap(px(10. * z))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .children(chip_rows)
+                .children(input_rows),
+        )
+        .child(send_button(generating, m, cx));
+    let mut bars_el = Vec::new();
+    for mut bar in bars
+        .into_iter()
+        .filter(|bar| bar.id == layout::TRANSCRIPT_BAR)
+    {
+        // At the window's edge, not beside the text (where it read as a rule).
+        bar.col = window_cols.saturating_sub(1);
+        bars_el.push(scrollbar(bar, m, cx));
+    }
+    div()
+        .flex_1()
+        .min_h(px(0.))
+        .relative()
+        .px(px(m.pad))
+        .pt(px(m.pad / 2.))
+        .flex()
+        .flex_col()
+        .child(transcript)
+        .child(div().flex().flex_col().children(dock_rows))
+        .child(composer_card)
+        .children(bars_el)
+        .children(dialog.map(|view| popup(view, m, cx)))
+        .into_any_element()
+}
+
+/// Send (or stop, while answering) at the composer's right edge.
+fn send_button(generating: bool, m: Metrics, cx: &mut Context<Root>) -> impl IntoElement {
+    let z = m.zoom;
+    let (label, glyph, tone) = if generating {
+        ("Stop", "■", NIGHT.error)
+    } else {
+        ("Send", "↑", NIGHT.accent)
+    };
+    div()
+        .id("send")
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .aria_keyshortcuts(if generating { "Escape" } else { "Enter" })
+        .flex_none()
+        .size(px(30. * z))
+        .rounded(px(8. * z))
+        .bg(color(tone))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(FONT)
+        .text_size(px(15. * z))
+        .text_color(color(NIGHT.bg))
+        .cursor_pointer()
+        .on_click(cx.listener(move |root, _, _, cx| {
+            if generating {
+                root.chat.stop();
+            } else {
+                let outcome = root.chat.key(Key::Enter, Mods::default());
+                root.apply(outcome, cx);
+            }
+            cx.notify();
+        }))
+        .child(glyph)
 }
 
 fn main() {

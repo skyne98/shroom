@@ -30,6 +30,15 @@ pub struct Popup {
     /// higher, mid-scroll; then there is one row more than `window`.
     pub window: usize,
     pub shift: f32,
+    /// For pixel clients, the same content as data: the text field (text,
+    /// placeholder), and per row the item's (name, hint), so a window can
+    /// draw a real field and proportional names with flush-right hints.
+    pub field: Option<(String, String)>,
+    pub labels: Vec<Option<(String, String)>>,
+    /// Row of the highlighted item.
+    pub selected: Option<usize>,
+    /// Column names over the hints (the model list), aligned like them.
+    pub header: Option<String>,
 }
 
 /// Blank columns after every item row, mirroring the two-cell lead on the
@@ -66,6 +75,10 @@ pub fn field(title: String, text: &str, placeholder: &str, width: usize) -> Popu
         bar: None,
         window: 0,
         shift: 0.0,
+        field: Some((text.to_string(), placeholder.to_string())),
+        labels: vec![None],
+        selected: None,
+        header: None,
     }
 }
 
@@ -83,6 +96,8 @@ pub fn picker(
     let width = width.max(12);
     let mut rows = Vec::with_capacity(items.len() + 2);
     let mut targets = Vec::with_capacity(items.len() + 2);
+    let mut labels = Vec::with_capacity(items.len() + 2);
+    let mut chosen = None;
 
     let mut field = vec![run("❯ ", ACCENT)];
     if query.is_empty() {
@@ -92,11 +107,13 @@ pub fn picker(
     }
     rows.push(field);
     targets.push(None);
+    labels.push(None);
     let caret = Some((0, (2 + query.width()).min(width - 1)));
 
     if items.is_empty() {
         rows.push(cell("no match · esc closes", width, DIM));
         targets.push(None);
+        labels.push(Some(("No match".to_string(), "esc closes".to_string())));
     }
     // More matches than rows: a scrollbar in the box's edge, past the rows.
     let bar = crate::layout::bar(width, 1, items.len(), total, top);
@@ -104,8 +121,8 @@ pub fn picker(
     for (index, label, selected) in items {
         // `name\thint`: the hint (a key, "current", a model's columns) sits
         // flush right and keeps its full width; the name gives way, with …
-        let (name, hint) = label.split_once('\t').unwrap_or((label, ""));
-        let hint = clip(hint, inner.saturating_sub(16).max(4));
+        let (name, full_hint) = label.split_once('\t').unwrap_or((label, ""));
+        let hint = clip(full_hint, inner.saturating_sub(16).max(4));
         // Lead "▌ ", the name, then (only with a hint) two cells and the hint.
         let gap = if hint.is_empty() { 0 } else { 2 };
         let room = inner.saturating_sub(2 + gap + hint.width());
@@ -115,10 +132,12 @@ pub fn picker(
                 run("▌ ", ACCENT.on(NIGHT.surface)),
                 band,
                 band.bold(),
-                DIM.on(NIGHT.surface),
+                // On the band, secondary text is full text colour: dim would
+                // drop below 4.5:1 there.
+                TEXT.on(NIGHT.surface),
             )
         } else {
-            (run("  ", DIM), TEXT, TEXT, Paint::fg(NIGHT.faint))
+            (run("  ", DIM), TEXT, TEXT, Paint::fg(NIGHT.muted))
         };
         let mut row = vec![lead];
         row.extend(cell(name, room, name_paint));
@@ -127,8 +146,12 @@ pub fn picker(
             row.push(run(hint, hint_paint));
         }
         row.push(run(" ".repeat(GUTTER), TEXT));
+        if *selected {
+            chosen = Some(rows.len());
+        }
         rows.push(row);
         targets.push(Some(*index));
+        labels.push(Some((name.to_string(), full_hint.to_string())));
     }
     let window = rows.len() - 1;
     Popup {
@@ -141,6 +164,10 @@ pub fn picker(
         bar,
         window,
         shift: 0.0,
+        field: Some((query.to_string(), "Type to search".to_string())),
+        labels,
+        selected: chosen,
+        header: None,
     }
 }
 

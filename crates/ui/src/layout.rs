@@ -1,9 +1,10 @@
-//! Character-grid layout shared by every frontend.
+//! Row layout shared by every frontend.
 //!
-//! Everything is laid out in monospace cells: a [`Row`] is exactly one line of
-//! the screen, already wrapped and padded. The terminal prints rows as-is; gpui
-//! draws them with a monospace font. Same rows, same wrapping, same pixels-per-
-//! cell decisions, so both clients look and behave identically.
+//! A [`Row`] is exactly one line of the screen, already wrapped. Widths are
+//! counted in monospace cells. The terminal prints rows as-is. The window
+//! draws prose runs ([`Face::Sans`]) in a proportional font: it sets a
+//! [`Style`] whose `measure` gives their width in cells, so they wrap
+//! where they really end; tool rows, code and tables stay monospace.
 
 use std::ops::Range;
 
@@ -12,6 +13,19 @@ use crate::highlight::Token;
 use crate::markdown::{self, Block, Ink};
 use crate::{Line, NIGHT, Role, transcript};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Which font a run is drawn in. The terminal draws every face in its one
+/// font; the window uses a proportional font for prose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Face {
+    /// Tool rows, code, tables, markers: everything that aligns on cells.
+    #[default]
+    Mono,
+    /// Prose: answers, prompts, reasoning.
+    Sans,
+    /// A heading, level 1..=3: prose, larger.
+    Title(u8),
+}
 
 /// Colour and weight of one run. Colours are `0xRRGGBB`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +36,7 @@ pub struct Paint {
     pub italic: bool,
     pub underline: bool,
     pub strike: bool,
+    pub face: Face,
 }
 
 impl Paint {
@@ -33,7 +48,12 @@ impl Paint {
             italic: false,
             underline: false,
             strike: false,
+            face: Face::Mono,
         }
+    }
+    pub const fn sans(mut self) -> Self {
+        self.face = Face::Sans;
+        self
     }
     pub const fn on(mut self, bg: u32) -> Self {
         self.bg = Some(bg);
@@ -54,6 +74,82 @@ pub const DIM: Paint = Paint::fg(NIGHT.dim);
 pub const ACCENT: Paint = Paint::fg(NIGHT.accent);
 pub const BAND: Paint = TEXT.on(NIGHT.surface);
 
+/// Width in cells of `text` drawn in a proportional face (`bold` or not).
+pub type Measure = std::rc::Rc<dyn Fn(&str, Face, bool) -> f32>;
+
+/// How a client draws prose, set once per frame ([`set_style`]).
+#[derive(Clone)]
+pub struct Style {
+    /// Width of proportional text in cells; None: every face is one cell
+    /// per column (the terminal).
+    pub measure: Option<Measure>,
+    /// Prose wraps at most this many cells wide (the reading measure);
+    /// code, tables and tool rows use the whole width.
+    pub prose: usize,
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Self {
+            measure: None,
+            prose: usize::MAX,
+        }
+    }
+}
+
+thread_local! {
+    static STYLE: std::cell::RefCell<Style> = std::cell::RefCell::new(Style::default());
+}
+
+/// The style the next layouts on this thread use.
+pub fn set_style(style: Style) {
+    STYLE.with(|current| *current.borrow_mut() = style);
+}
+
+fn prose_width() -> usize {
+    STYLE.with(|style| style.borrow().prose)
+}
+
+/// A client that draws prose itself (the window): no terminal markers.
+fn pixels() -> bool {
+    STYLE.with(|style| style.borrow().measure.is_some())
+}
+
+/// Width of `text` drawn with `paint`, in cells (fractional for prose in
+/// a proportional font).
+pub fn text_width(text: &str, paint: Paint) -> f32 {
+    STYLE.with(|style| match (&style.borrow().measure, paint.face) {
+        (Some(measure), face) if face != Face::Mono => measure(text, face, paint.bold),
+        _ => text.width() as f32,
+    })
+}
+
+/// Longest prefix of `text` that fits in `room` cells drawn with `paint`.
+fn fit_prefix(text: &str, paint: Paint, room: f32) -> String {
+    if paint.face == Face::Mono || STYLE.with(|style| style.borrow().measure.is_none()) {
+        return clip(text, room.max(0.0) as usize);
+    }
+    let mut used = 0.0;
+    let mut end = 0;
+    for (at, ch) in text.char_indices() {
+        let w = text_width(ch.encode_utf8(&mut [0; 4]), paint);
+        if used + w > room {
+            break;
+        }
+        used += w;
+        end = at + ch.len_utf8();
+    }
+    text[..end].to_string()
+}
+
+/// A rounded backdrop behind a block of rows: a prompt or a code panel.
+/// The terminal paints their cells' background; the window draws a card
+/// behind the rows instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Panel {
+    Prompt,
+    Code,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Run {
     pub text: String,
@@ -76,23 +172,33 @@ pub fn width(row: &[Run]) -> usize {
 
 pub fn ink(ink: Ink) -> Paint {
     match ink {
-        Ink::Plain => TEXT,
-        Ink::Bold => TEXT.bold(),
-        Ink::Italic => TEXT.italic(),
+        Ink::Plain => TEXT.sans(),
+        Ink::Bold => TEXT.bold().sans(),
+        Ink::Italic => TEXT.italic().sans(),
         Ink::Strike => Paint {
             strike: true,
-            ..DIM
+            ..DIM.sans()
         },
-        Ink::Code => Paint::fg(NIGHT.code).on(NIGHT.surface),
+        // Colour alone marks inline code: a background on every file name
+        // made answers look striped.
+        Ink::Code => Paint::fg(NIGHT.code),
         Ink::Syntax(token) => Paint::fg(syntax(token)),
-        // Four visible tiers: underlined accent, accent, bright, dim.
+        // Four visible tiers: underlined accent, accent, bright, dim; the
+        // window also draws the first three larger.
         Ink::Heading(1) => Paint {
             underline: true,
+            face: Face::Title(1),
             ..ACCENT.bold()
         },
-        Ink::Heading(2) => ACCENT.bold(),
-        Ink::Heading(3) => TEXT.bold(),
-        Ink::Heading(_) => DIM.bold(),
+        Ink::Heading(2) => Paint {
+            face: Face::Title(2),
+            ..ACCENT.bold()
+        },
+        Ink::Heading(3) => Paint {
+            face: Face::Title(3),
+            ..TEXT.bold()
+        },
+        Ink::Heading(_) => DIM.bold().sans(),
         Ink::Dim => DIM,
     }
 }
@@ -105,17 +211,30 @@ fn syntax(token: Token) -> u32 {
 /// with `hang` so wrapped text keeps its column. `fill` pads every row to the
 /// full width (bands behind prompts and code).
 pub fn wrap(first: Row, hang: Row, body: Row, width: usize, fill: Option<Paint>) -> Vec<Row> {
-    fn finish(row: &mut Row, col: usize, width: usize, fill: Option<Paint>, rows: &mut Vec<Row>) {
+    fn finish(row: &mut Row, col: f32, width: usize, fill: Option<Paint>, rows: &mut Vec<Row>) {
+        // Padding is always whole cells (a proportional row's padding is
+        // background only, which the window draws as a card anyway).
+        let pad = (width as f32 - col).floor();
         if let Some(paint) = fill
-            && col < width
+            && pad >= 1.0
         {
-            row.push(run(" ".repeat(width - col), paint));
+            let paint = Paint {
+                face: Face::Mono,
+                ..paint
+            };
+            row.push(run(" ".repeat(pad as usize), paint));
         }
         rows.push(std::mem::take(row));
     }
+    let row_width = |row: &Row| {
+        row.iter()
+            .map(|run| text_width(&run.text, run.paint))
+            .sum::<f32>()
+    };
     let width = width.max(8);
+    let limit = width as f32 + 0.001;
     let mut rows = Vec::new();
-    let mut col = self::width(&first);
+    let mut col = row_width(&first);
     let mut row = first;
     let mut empty = true;
     for span in body {
@@ -123,10 +242,10 @@ pub fn wrap(first: Row, hang: Row, body: Row, width: usize, fill: Option<Paint>)
         for word in span.text.split_inclusive(' ') {
             let mut rest = word;
             while !rest.is_empty() {
-                if col + rest.trim_end().width() <= width {
+                if col + text_width(rest.trim_end(), paint) <= limit {
                     // Trailing spaces may hang past the edge; clip them.
-                    let fits: String = clip(rest, width - col);
-                    col += fits.width();
+                    let fits = fit_prefix(rest, paint, width as f32 - col);
+                    col += text_width(&fits, paint);
                     row.push(run(fits, paint));
                     empty = false;
                     break;
@@ -134,20 +253,20 @@ pub fn wrap(first: Row, hang: Row, body: Row, width: usize, fill: Option<Paint>)
                 if !empty {
                     finish(&mut row, col, width, fill, &mut rows);
                     row = hang.clone();
-                    col = self::width(&row);
+                    col = row_width(&row);
                     empty = true;
                     rest = rest.trim_start();
                     continue;
                 }
                 // One word wider than the row: hard split it.
-                let room = width.saturating_sub(col).max(1);
-                let piece = clip(rest, room);
+                let room = (width as f32 - col).max(1.0);
+                let piece = fit_prefix(rest, paint, room);
                 let piece = if piece.is_empty() {
                     rest.chars().next().map(String::from).unwrap_or_default()
                 } else {
                     piece
                 };
-                col += piece.width();
+                col += text_width(&piece, paint);
                 rest = &rest[piece.len()..];
                 row.push(run(piece, paint));
                 empty = false;
@@ -184,6 +303,8 @@ pub struct Laid {
     pub images: Vec<Picture>,
     /// (row, key) of every folded run's summary row: a click opens it.
     pub folds: Vec<(usize, usize)>,
+    /// Blocks drawn on a card: (rows, columns, kind).
+    pub panels: Vec<(Range<usize>, Range<usize>, Panel)>,
 }
 
 /// How finished work (reasoning, programs, subagents) is drawn. By default
@@ -244,6 +365,12 @@ impl Laid {
                 .into_iter()
                 .map(|(row, key)| (row + offset, key)),
         );
+        self.panels.extend(
+            other
+                .panels
+                .into_iter()
+                .map(|(rows, cols, kind)| (rows.start + offset..rows.end + offset, cols, kind)),
+        );
         self.rows.extend(other.rows);
     }
 }
@@ -260,16 +387,20 @@ pub fn transcript_rows(body: &[String], width: usize, copy: Option<&str>, fold: 
             laid.rows.push(Row::new());
         }
         if parsed[index].role == Role::User {
+            let top = laid.rows.len();
             for (line, text) in parsed[index].text.split('\n').enumerate() {
-                let first = run(if line == 0 { "> " } else { "  " }, DIM.on(NIGHT.surface));
+                let marker = if line == 0 && !pixels() { "> " } else { "  " };
+                let first = run(marker, DIM.on(NIGHT.surface));
                 laid.rows.extend(wrap(
                     vec![first],
                     vec![run("  ", BAND)],
-                    vec![run(text, BAND)],
+                    vec![run(text, BAND.sans())],
                     width,
                     Some(BAND),
                 ));
             }
+            laid.panels
+                .push((top..laid.rows.len(), 0..width, Panel::Prompt));
             index += 1;
             continue;
         }
@@ -312,9 +443,11 @@ pub fn turn_rows(lines: &[Line], width: usize, copy: Option<&str>, fold: Fold, l
             at += 1;
             continue;
         }
+        // Images a program read belong to its run: they stay visible under
+        // the one summary row instead of splitting the run in two.
         let end = blocks[at..]
             .iter()
-            .position(|block| !is_work(block.2))
+            .position(|block| !is_work(block.2) && block.2 != Role::Image)
             .map_or(blocks.len(), |offset| at + offset);
         let run = &blocks[at..end];
         let key = fold.base + start;
@@ -348,13 +481,30 @@ pub fn turn_rows(lines: &[Line], width: usize, copy: Option<&str>, fold: Fold, l
             } else {
                 (run, None)
             };
-            if !done.is_empty() {
+            let work: Vec<_> = done
+                .iter()
+                .copied()
+                .filter(|block| is_work(block.2))
+                .collect();
+            if !work.is_empty() {
                 if previous.is_some() {
                     laid.rows.push(Row::new());
                 }
                 laid.folds.push((laid.rows.len(), key));
-                laid.rows.push(summary_row(lines, done, width, "▸ "));
+                laid.rows.push(summary_row(lines, &work, width, "▸ "));
                 previous = Some(Role::Program);
+            }
+            for &block in done.iter().filter(|block| block.2 == Role::Image) {
+                block_rows(
+                    &mut laid,
+                    &mut previous,
+                    lines,
+                    block,
+                    width,
+                    copy,
+                    true,
+                    false,
+                );
             }
             if let Some(block) = current {
                 block_rows(
@@ -440,13 +590,29 @@ fn block_rows(
                 laid.extend(image_rows(&line.text, width));
             }
         }
+        Role::Changes => {
+            for line in group {
+                let (summary, paths) = line.text.split_once('\t').unwrap_or((&line.text, ""));
+                let mut body = vec![run(summary, DIM)];
+                if !paths.is_empty() {
+                    body.push(run(format!(" · {paths}"), Paint::fg(NIGHT.muted)));
+                }
+                laid.rows.extend(wrap(
+                    vec![run("✎ ", DIM)],
+                    vec![run("  ", DIM)],
+                    body,
+                    width,
+                    None,
+                ));
+            }
+        }
         Role::Fail => {
             let error = Paint::fg(NIGHT.error);
             for line in group {
                 laid.rows.extend(wrap(
                     vec![run("⚠ ", error)],
                     vec![run("  ", error)],
-                    vec![run(line.text.clone(), error)],
+                    vec![run(line.text.clone(), error.sans())],
                     width,
                     None,
                 ));
@@ -530,7 +696,7 @@ fn summary_row(lines: &[Line], work: &[(usize, usize, Role)], width: usize, mark
     } else {
         titles.join(", ")
     };
-    let mut right = vec![run(meta.join(" · "), Paint::fg(NIGHT.faint))];
+    let mut right = vec![run(meta.join(" · "), Paint::fg(NIGHT.muted))];
     if failed > 0 {
         right.push(run(format!(" · {failed} failed"), Paint::fg(NIGHT.error)));
     }
@@ -539,6 +705,7 @@ fn summary_row(lines: &[Line], work: &[(usize, usize, Role)], width: usize, mark
 
 const THOUGHT: Paint = Paint {
     italic: true,
+    face: Face::Sans,
     ..DIM
 };
 
@@ -857,10 +1024,14 @@ fn is_bar(span: &markdown::Span) -> bool {
 
 /// One assistant answer: `● ` marker on the first row, markdown blocks below.
 pub fn answer_rows(text: &str, width: usize, copy: Option<&str>) -> Laid {
+    // Prose keeps a reading measure; code, tables and rules use the width.
+    let prose = width.min(prose_width().max(24));
     let blocks = markdown::render(text, width.saturating_sub(4).max(8));
     let mut laid = Laid::default();
     let rows = &mut laid.rows;
     let mut index = 0;
+    // Rows the previous top-level list item took: long items get air.
+    let mut last_item: Option<usize> = None;
     while index < blocks.len() {
         let block = &blocks[index];
         if block.code {
@@ -869,15 +1040,39 @@ pub fn answer_rows(text: &str, width: usize, copy: Option<&str>) -> Laid {
                 .position(|block| !block.code)
                 .map_or(blocks.len(), |offset| index + offset);
             let (panel, code) = code_panel(&blocks[index..end], width, index == 0, copy);
+            let outside = 2
+                + blocks[index].indent
+                + 2 * blocks[index]
+                    .spans
+                    .iter()
+                    .take_while(|span| is_bar(span))
+                    .count();
             laid.copies.push((rows.len(), code));
+            laid.panels.push((
+                rows.len()..rows.len() + panel.len(),
+                outside..width,
+                Panel::Code,
+            ));
             rows.extend(panel);
             index = end;
+            last_item = None;
             continue;
         }
         index += 1;
         if block.spans.is_empty() {
             rows.push(Row::new());
+            last_item = None;
             continue;
+        }
+        let item = block.indent == 2
+            && block.spans.first().is_some_and(|span| {
+                span.ink == Ink::Dim
+                    && span.text.ends_with(' ')
+                    && span.text.len() <= 5
+                    && !is_bar(span)
+            });
+        if item && last_item.is_some_and(|rows| rows > 1) {
+            rows.push(Row::new());
         }
         let marker = if index == 1 {
             run("● ", ACCENT)
@@ -910,10 +1105,26 @@ pub fn answer_rows(text: &str, width: usize, copy: Option<&str>) -> Laid {
         let body = block
             .spans
             .iter()
-            .map(|span| run(span.text.clone(), ink(span.ink)))
+            .map(|span| {
+                let mut paint = ink(span.ink);
+                if block.mono {
+                    paint.face = Face::Mono;
+                }
+                run(span.text.clone(), paint)
+            })
             .collect();
         let first = vec![marker, run(" ".repeat(block.indent), TEXT)];
-        rows.extend(wrap(first, hang, body, width, None));
+        let measure = if block.mono { width } else { prose };
+        let before = rows.len();
+        rows.extend(wrap(first, hang, body, measure, None));
+        last_item = if item {
+            Some(rows.len() - before)
+        } else if block.indent > 2 {
+            // A nested item belongs to the item above it.
+            last_item.map(|rows_so_far| rows_so_far + 1)
+        } else {
+            None
+        };
     }
     laid
 }
@@ -952,7 +1163,7 @@ fn code_panel(
     } else {
         0
     };
-    let number = Paint::fg(NIGHT.faint).on(NIGHT.surface);
+    let number = Paint::fg(NIGHT.muted).on(NIGHT.surface);
 
     let mut rows = Vec::with_capacity(code.len() + 1);
     let mut head = outside;
@@ -1015,7 +1226,7 @@ pub struct InputRow {
     pub cols: Vec<usize>,
 }
 
-const CARET: Paint = Paint::fg(NIGHT.bg).on(NIGHT.accent);
+pub const CARET: Paint = Paint::fg(NIGHT.bg).on(NIGHT.accent);
 const SELECT: Paint = TEXT.on(NIGHT.select);
 
 /// Cells a char takes in the prompt; tabs and controls show as one space.
@@ -1037,14 +1248,15 @@ pub fn input(
 ) -> (Vec<InputRow>, usize) {
     let text = editor.text();
     // Unfocused (a popup is open): no caret, no selection highlight.
-    let caret_paint = if focused { CARET } else { DIM };
+    let caret_paint = if focused { CARET.sans() } else { DIM };
+    // The window's composer is a card of its own: no prompt marker there.
+    let marker = if pixels() { "" } else { "> " };
     if text.is_empty() {
-        let mut rest = placeholder.chars();
-        let first = rest.next().map_or(" ".into(), String::from);
+        // The caret sits before the placeholder, never on its first letter.
         let row = vec![
-            run("> ", ACCENT),
-            run(first, caret_paint),
-            run(rest.as_str(), DIM),
+            run(marker, ACCENT),
+            run(" ", caret_paint),
+            run(placeholder, DIM.sans()),
         ];
         let empty = InputRow {
             row,
@@ -1055,21 +1267,30 @@ pub fn input(
         return (vec![empty], 0);
     }
     // Room for the prefix and a caret cell after a full row.
-    let avail = width.saturating_sub(3).max(4);
+    let avail = width.saturating_sub(3).max(4) as f32;
+    // Typed text is prose: proportional in the window (it hit-tests clicks
+    // itself, see `Chat::click_text`), cells in the terminal.
+    let shown = |c: char| {
+        if c == '\t' || c.is_control() {
+            text_width(" ", TEXT.sans())
+        } else {
+            text_width(c.encode_utf8(&mut [0; 4]), TEXT.sans())
+        }
+    };
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut base = 0;
     for line in text.split('\n') {
-        let (mut start, mut col, mut space) = (base, 0, None);
+        let (mut start, mut col, mut space) = (base, 0.0f32, None);
         for (i, c) in line.char_indices() {
             let at = base + i;
-            let w = cells(c);
+            let w = shown(c);
             if col + w > avail && at > start {
                 // Break after the last space on the row, else mid-word.
                 let cut = space.filter(|&sp| sp > start && sp <= at).unwrap_or(at);
                 ranges.push((start, cut));
                 start = cut;
                 space = None;
-                col = text[cut..at].chars().map(cells).sum();
+                col = text[cut..at].chars().map(shown).sum();
             }
             col += w;
             if c == ' ' {
@@ -1098,17 +1319,22 @@ pub fn input(
         .iter()
         .enumerate()
         .map(|(r, &(start, end))| {
-            let mut row = vec![run(if r == 0 { "> " } else { "  " }, ACCENT)];
+            let lead = match (r, marker.is_empty()) {
+                (_, true) => "",
+                (0, false) => "> ",
+                _ => "  ",
+            };
+            let mut row = vec![run(lead, ACCENT)];
             let mut cols = Vec::new();
             for (i, c) in text[start..end].char_indices() {
                 let at = start + i;
                 let shown = if c == '\t' || c.is_control() { ' ' } else { c };
                 let paint = if focused && r == caret && at == cursor {
-                    CARET
+                    CARET.sans()
                 } else if selected(at) {
-                    SELECT
+                    SELECT.sans()
                 } else {
-                    TEXT
+                    TEXT.sans()
                 };
                 match row.last_mut() {
                     Some(last) if last.paint == paint && last.text != "> " => last.text.push(shown),
@@ -1117,7 +1343,7 @@ pub fn input(
                 cols.extend(std::iter::repeat_n(at, cells(c)));
             }
             if focused && r == caret && cursor == end {
-                row.push(run(" ", CARET));
+                row.push(run(" ", CARET.sans()));
             } else if text[end..].starts_with('\n') && selected(end) {
                 // A selected newline shows as one highlighted cell.
                 row.push(run(" ", SELECT));

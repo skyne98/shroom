@@ -37,6 +37,8 @@ pub struct Block {
     /// True for code-block rows. A block's rows are: a label row (one Dim
     /// span: the language), then the code lines.
     pub code: bool,
+    /// Aligned on cells (table rows, rules): drawn monospace everywhere.
+    pub mono: bool,
 }
 
 impl Block {
@@ -146,6 +148,7 @@ impl State {
                         text: "─".repeat(width.max(8)),
                     }],
                     code: false,
+                    mono: true,
                 });
             }
             // Raw HTML is dropped rather than shown as tag soup.
@@ -273,6 +276,7 @@ impl State {
                         indent: self.indent,
                         spans,
                         code: false,
+                        mono: true,
                     });
                 }
                 // Big headings get air below; small ones hug their section.
@@ -359,6 +363,7 @@ impl State {
                 indent: self.indent,
                 spans,
                 code: false,
+                mono: true,
             });
             if index == 0 {
                 let rule = widths
@@ -371,6 +376,7 @@ impl State {
                     indent: self.indent,
                     spans,
                     code: false,
+                    mono: true,
                 });
             }
         }
@@ -398,6 +404,7 @@ impl State {
             indent: self.indent,
             spans,
             code: false,
+            mono: false,
         });
     }
 
@@ -413,6 +420,7 @@ impl State {
             indent: self.indent,
             spans,
             code,
+            mono: code,
         });
     }
 

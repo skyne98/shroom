@@ -157,6 +157,8 @@ pub enum Key {
     List,
     /// How open a scrollbar is (0 collapsed, 1 hovered), by bar id.
     Bar(usize),
+    /// The window's sidebar: 0 hidden, 1 shown.
+    Sidebar,
 }
 
 /// Every running motion. Protocol, once per frame: [`Motions::tick`] first,

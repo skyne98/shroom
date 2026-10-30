@@ -66,6 +66,13 @@ pub fn toplevel(cwd: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(out.trim()))
 }
 
+/// The branch checked out around `cwd` (None outside git, or detached).
+pub fn branch(cwd: &Path) -> Option<String> {
+    let name = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"], None).ok()?;
+    let name = name.trim();
+    (!name.is_empty() && name != "HEAD").then(|| name.to_string())
+}
+
 /// A session's snapshot repo over the user's checkout.
 pub struct Shadow {
     git_dir: PathBuf,
@@ -246,21 +253,23 @@ pub fn begin_turn(dir: &Path, cwd: &Path, mut mark: Mark) -> Option<(Shadow, Str
     Some((shadow?, before?))
 }
 
-/// After a turn: record what it changed in the last mark.
-pub fn end_turn(dir: &Path, (shadow, before): (Shadow, String)) {
+/// After a turn: record what it changed in the last mark. Returns the
+/// changed paths.
+pub fn end_turn(dir: &Path, (shadow, before): (Shadow, String)) -> Vec<String> {
     let Ok(after) = shadow.snap() else {
-        return;
+        return Vec::new();
     };
     let Ok(changed) = shadow.changed(&before, &after) else {
-        return;
+        return Vec::new();
     };
     let mut all = marks(dir);
     if let Some(last) = all.last_mut()
         && last.before.as_deref() == Some(before.as_str())
     {
-        last.changed = Some(changed);
+        last.changed = Some(changed.clone());
         save_marks(dir, &all);
     }
+    changed
 }
 
 /// Paths the turns from mark `at` on changed (a turn that never ended counts
@@ -439,7 +448,7 @@ mod tests {
         std::fs::write(root.join("src/a.txt"), "two\n").unwrap();
         std::fs::create_dir_all(root.join("new")).unwrap();
         std::fs::write(root.join("new/b.txt"), "b\n").unwrap();
-        end_turn(&dir, turn);
+        let _ = end_turn(&dir, turn);
         // Between turns the user edits a file of their own.
         std::fs::write(root.join("mine.txt"), "mine\n").unwrap();
         // Turn 2 never ends (the app died): what changed since counts.
