@@ -33,6 +33,20 @@ Both hooks are optional, JSON in / JSON out, chained in load order:
 - smash_action(Action) -> Action: inspect or rewrite any action. Empty reply keeps it, null drops it.
 - smash_view(View) -> View: decorate every frame: rows, status, title.
 
+## Install (Nix)
+
+```sh
+nix run github:skyne98/smash            # terminal app (smash)
+nix run github:skyne98/smash#desktop    # desktop app (smash-gpui)
+nix profile install github:skyne98/smash
+```
+
+NixOS flake: add the input `smash.url = "github:skyne98/smash"` (with
+`smash.inputs.nixpkgs.follows = "nixpkgs"`) and put
+`inputs.smash.packages.${system}.default` in your packages, or use
+`overlays.default`. The desktop app gets a launcher entry. API keys come from
+the environment (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, ...).
+
 ## Run
 
 ```sh

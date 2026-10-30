@@ -149,6 +149,10 @@ fn copy(text: &str) -> std::io::Result<()> {
 }
 
 fn main() -> std::io::Result<()> {
+    if std::env::args().any(|arg| arg == "--version") {
+        println!("smash {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let mut chat = Chat::open().with_startup_prompt();
     let mut terminal = ratatui::init();
     // Alternate scroll mode: the wheel arrives as ↑/↓ keys and mouse selection

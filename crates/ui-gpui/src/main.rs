@@ -598,11 +598,18 @@ impl Render for Root {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--version") {
+        println!("smash {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // Matches the launcher entry (StartupWMClass) so docks and
+                // window lists show it as smash.
+                app_id: Some("smash".into()),
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| Root::new(window, cx)),
