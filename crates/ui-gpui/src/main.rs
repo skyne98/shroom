@@ -4,6 +4,8 @@
 //! sidebar, a header, prose in a proportional font, cards behind prompts and
 //! code, a composer card with a send button, and real dialogs.
 
+mod desk;
+
 use std::ops::Range;
 use std::time::Duration;
 
@@ -18,7 +20,7 @@ use gpui::{
 use gpui_platform::application;
 use shroom_ui::NIGHT;
 use shroom_ui::chat::{Chat, Chrome, Cursor, Frame, Key, Mods, Outcome, Welcome};
-use shroom_ui::layout::{self, Bar, Face, Paint, Panel, Row};
+use shroom_ui::layout::{self, Face, Paint, Panel, Row};
 use shroom_ui::popup::Popup;
 
 const FONT: &str = "JetBrainsMono Nerd Font";
@@ -98,6 +100,8 @@ struct Root {
     input: gpui::Entity<zeron_ui::composer::ComposerInput>,
     /// The prompt text both sides last agreed on.
     synced: String,
+    /// The transcript, drawn with zeron's markdown renderer.
+    transcript: gpui::Entity<desk::Transcript>,
     _input_events: gpui::Subscription,
     /// Proportional glyph advances, at zoom 1 in cells, by (face, bold).
     advances: Advances,
@@ -258,6 +262,7 @@ impl Root {
             chip_label: String::new(),
             input,
             synced: String::new(),
+            transcript: cx.new(|_| desk::Transcript::new()),
             _input_events: input_events,
             hit_area: HitArea::default(),
             advances: Default::default(),
@@ -444,9 +449,10 @@ impl Root {
             // The composer is zeron's input; it handles its own pointer.
             return None;
         }
-        let col = ((x - self.origin.0) / cell).max(0.) as usize;
-        let row = (((y - self.origin.1) / line).max(0.) as usize).min(area.above.saturating_sub(1));
-        Some((row, col))
+        // The transcript is zeron's list, with its own pointer handling;
+        // only a click outside an open list reaches the chat (to close it).
+        let _ = (cell, line);
+        self.chat.in_picker().then_some((0, 0))
     }
 
     /// Pick the effort level under `x` on the slider.
@@ -537,6 +543,10 @@ impl Root {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // Outside a list, the transcript (zeron's list) scrolls itself.
+        if !self.chat.in_picker() {
+            return;
+        }
         // In rows, as the system reports them: a wheel notch already comes
         // as its scroll-lines setting (3), a touchpad as pixels.
         let rows = match event.delta {
@@ -759,62 +769,6 @@ fn picture(shown: &shroom_ui::chat::Shown, shift: Pixels, m: Metrics) -> impl In
 /// Scrollbar overlay. Collapsed (the pointer elsewhere) it is a thin faint
 /// thumb and no track, out of the way; hovered (or dragged) it springs open
 /// to a full track and thumb. Its hover area is the whole cell column, so
-/// it is easy to find; clicks still land on the grid underneath.
-fn scrollbar(bar: Bar, m: Metrics, cx: &mut Context<Root>) -> gpui::AnyElement {
-    scrollbar_at(bar, m, (m.pad, m.pad / 2.), cx)
-}
-
-/// A scrollbar on a grid whose first cell is at `origin` (px) in its parent.
-fn scrollbar_at(
-    bar: Bar,
-    m: Metrics,
-    origin: (f32, f32),
-    cx: &mut Context<Root>,
-) -> gpui::AnyElement {
-    let (cell, line) = (m.cell, m.line);
-    let rows = |range: std::ops::Range<usize>| px(range.len() as f32 * line);
-    let open = bar.openness();
-    let inset = px(2.);
-    // 3 px collapsed, 6 px open; the track fades in with it.
-    let width = 3. + 3. * open;
-    let track = shroom_ui::motion::mix(NIGHT.bg, NIGHT.surface, f64::from(open));
-    let thumb = shroom_ui::motion::mix(NIGHT.faint, NIGHT.dim, f64::from(open));
-    let id = bar.id;
-    div()
-        .id(("scrollbar", id))
-        .absolute()
-        .left(px(origin.0) + cell * bar.col as f32)
-        .top(px(origin.1 + bar.rows.start as f32 * line))
-        .w(cell)
-        .h(rows(bar.rows.clone()))
-        .on_hover(cx.listener(move |root, hovered: &bool, _, cx| {
-            if root.chat.hover_bar(id, *hovered) {
-                cx.notify();
-            }
-        }))
-        .child(
-            div()
-                .absolute()
-                .left((cell - px(width)) / 2.)
-                .top(inset)
-                .w(px(width))
-                .h(rows(bar.rows.clone()) - inset * 2.)
-                .rounded_full()
-                .bg(color(track))
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top(px((bar.thumb.start - bar.rows.start) as f32 * line))
-                        .w_full()
-                        .h(rows(bar.thumb.clone()))
-                        .rounded_full()
-                        .bg(color(thumb)),
-                ),
-        )
-        .into_any_element()
-}
-
 /// A dialog: a centered card over a dimmed window, title, a real text
 /// field, then the items as rows with proportional names and flush-right
 /// hints. Clicks inside never reach the chat; a click on the dimmed backdrop
@@ -1627,6 +1581,10 @@ impl Render for Root {
         // The grid counts a rule and a status row the window doesn't draw.
         let rows = ((f32::from(viewport.height) - chrome_h - m.pad) / m.line + 2.).max(4.);
         let frame = self.chat.frame(columns as usize, rows as usize);
+        if let Some(view) = self.chat.desk() {
+            self.transcript
+                .update(cx, |transcript, _| transcript.sync(&view));
+        }
         self.shown = frame.rows[..frame.viewport.min(frame.rows.len())].to_vec();
         let chrome = frame.chrome.clone();
         if let Some(chrome) = &chrome {
@@ -1688,6 +1646,7 @@ impl Render for Root {
             &hover,
             self.slider.clone(),
             self.input.clone(),
+            self.transcript.clone(),
             cx,
         );
         let side = (sidebar_w > 1.)
@@ -1748,6 +1707,7 @@ fn chat_body(
     hover: &dyn Fn(&str) -> f32,
     slider: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     input: gpui::Entity<zeron_ui::composer::ComposerInput>,
+    list: gpui::Entity<desk::Transcript>,
     cx: &mut Context<Root>,
 ) -> gpui::AnyElement {
     let z = m.zoom;
@@ -1801,23 +1761,29 @@ fn chat_body(
             })
             .opacity(card.fade * content)
     });
+    // zeron's markdown renderer draws the transcript; the grid's rows are
+    // the terminal's.
+    let _ = (cards, pictures, above, shift_px, &mut rows);
+    let root = cx.entity();
+    let on_fold: desk::OnFold = std::rc::Rc::new(move |key| {
+        let root = root.clone();
+        Box::new(move |_, _, cx| {
+            root.update(cx, |root, cx| {
+                root.chat.toggle_fold(key);
+                cx.notify();
+            });
+        })
+    });
     let transcript = div()
         .id("transcript")
         .role(gpui::Role::Log)
         .aria_label("Conversation")
         .relative()
-        .h(px(viewport as f32 * m.line))
-        .overflow_hidden()
-        .children(cards)
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .mt(shift_px - px(m.line))
-                .child(row(above.unwrap_or_default(), &[], m))
-                .children(rows.drain(..).map(|(cells, zones)| row(cells, &zones, m))),
-        )
-        .children(pictures)
+        .flex_1()
+        .min_h(px(0.))
+        .ml(m.cell * column.start as f32)
+        .w(m.cell * column.len() as f32)
+        .child(desk::element(list, on_fold, cx))
         .when_some(empty.filter(|_| dialog.is_none()), |area, info| {
             area.child(welcome(&info, m, cx))
         });
@@ -2018,15 +1984,9 @@ fn chat_body(
         .text_color(color(NIGHT.muted))
         .child(div().min_w(px(0.)).children(notice))
         .children(context);
-    let mut bars_el = Vec::new();
-    for mut bar in bars
-        .into_iter()
-        .filter(|bar| bar.id == layout::TRANSCRIPT_BAR)
-    {
-        // At the window's edge, not beside the text (where it read as a rule).
-        bar.col = window_cols.saturating_sub(1);
-        bars_el.push(scrollbar(bar, m, cx));
-    }
+    // The list scrolls itself (wheel, touchpad, keys); the grid's bar was
+    // the terminal's.
+    let _ = (bars, window_cols);
     // Pixels left over by the whole-row grid go above the transcript, so
     // the composer always sits on the window's bottom edge.
     div()
@@ -2042,7 +2002,6 @@ fn chat_body(
         .child(div().flex().flex_col().children(dock_rows))
         .child(composer_card)
         .child(status)
-        .children(bars_el)
         .into_any_element()
 }
 

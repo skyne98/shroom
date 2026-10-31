@@ -183,6 +183,21 @@ pub struct Chrome {
     pub effort: Option<EffortPanel>,
 }
 
+/// The transcript as the window draws it with zeron's renderer: stored and
+/// in-flight lines, the spinner, and which work runs are open.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Desk {
+    pub doc: DocId,
+    pub lines: Vec<crate::Line>,
+    pub live: Vec<crate::Line>,
+    /// `Thinking… (12s · 340 tokens written · esc to stop)`, while answering.
+    pub spinner: Option<String>,
+    /// Ctrl+O: every run open.
+    pub details: bool,
+    /// Runs opened one by one, by their first line's index.
+    pub open: std::collections::HashSet<usize>,
+}
+
 /// The window's model and effort panel (zeron's compact picker): a slider
 /// over the model's effort levels and a link to the model list.
 #[derive(Clone, Debug, PartialEq)]
@@ -3212,6 +3227,47 @@ impl Chat {
             self.editor = Editor::default();
             self.editor.insert(text);
         }
+    }
+
+    /// The transcript for the window's own renderer.
+    pub fn desk(&mut self) -> Option<Desk> {
+        let doc = self.client.app().selected()?.id;
+        let view = self.client.view();
+        let viewed = Some(doc) == self.live_doc;
+        let live = if viewed && self.clock.running_secs().is_some() {
+            crate::answer_lines(&serialize(&self.live))
+        } else {
+            Vec::new()
+        };
+        let spinner = self.clock.running_secs().filter(|_| viewed).map(|elapsed| {
+            let tokens = if self.usage.output > 0 {
+                format!(" · {} tokens written", self.usage.output)
+            } else {
+                String::new()
+            };
+            format!(
+                "{}… ({elapsed:.0}s{tokens} · esc to stop)",
+                spinner_word(elapsed)
+            )
+        });
+        Some(Desk {
+            doc,
+            lines: crate::transcript(&view.transcript),
+            live,
+            spinner,
+            details: self.settings.details,
+            open: self.unfolded.get(&doc).cloned().unwrap_or_default(),
+        })
+    }
+
+    /// Open or fold work run `key` (the window's click on its summary).
+    pub fn toggle_fold(&mut self, key: usize) {
+        let doc = self.client.app().selected().map_or(0, |doc| doc.id);
+        let open = self.unfolded.entry(doc).or_default();
+        if !open.remove(&key) {
+            open.insert(key);
+        }
+        self.cache = None;
     }
 
     /// A list is open (it takes the keys, the window's input steps aside).
