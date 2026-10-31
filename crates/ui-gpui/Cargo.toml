@@ -13,4 +13,6 @@ shroom-ui = { workspace = true }
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
 gpui-base = { workspace = true }
+# zeron's own UI crate (MIT): its markdown renderer and composer input.
+zeron-ui = { git = "https://github.com/zeronsh/zeron", rev = "55ffd4142d1572b26b5b7bca511050f4e7c0e1c1" }
 unicode-width = "0.2"

@@ -3205,6 +3205,20 @@ impl Chat {
     }
 
     /// The prompt's text (pixel clients hit-test their own rows of it).
+    /// Replace the prompt's text (the window's own input owns typing), caret
+    /// at the end.
+    pub fn set_input(&mut self, text: &str) {
+        if self.editor.text() != text {
+            self.editor = Editor::default();
+            self.editor.insert(text);
+        }
+    }
+
+    /// A list is open (it takes the keys, the window's input steps aside).
+    pub fn in_picker(&self) -> bool {
+        self.mode == Mode::Picker
+    }
+
     pub fn input_text(&self) -> &str {
         self.editor.text()
     }

@@ -7,6 +7,7 @@
 use std::ops::Range;
 use std::time::Duration;
 
+use gpui::Focusable as _;
 use gpui::{
     App, Bounds, ClipboardEntry, ClipboardItem, Context, ExternalPaths, FocusHandle, Font,
     FontStyle, FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -92,6 +93,12 @@ struct Root {
     sliding: bool,
     /// The model chip's text last frame (it sizes the room beside the prompt).
     chip_label: String,
+    /// zeron's composer input: it owns typing, selection, IME and paste; the
+    /// chat keeps the prompt's text in step with it.
+    input: gpui::Entity<zeron_ui::composer::ComposerInput>,
+    /// The prompt text both sides last agreed on.
+    synced: String,
+    _input_events: gpui::Subscription,
     /// Proportional glyph advances, at zoom 1 in cells, by (face, bold).
     advances: Advances,
     _tick: Task<()>,
@@ -109,9 +116,6 @@ struct HitArea {
     /// Screen rows above the composer (transcript and dock).
     above: usize,
     composer: (f32, f32),
-    first_input: usize,
-    last_input: usize,
-    column_start: usize,
 }
 
 /// The desktop's "reduce animations" switch (GNOME/GTK setting, also read
@@ -195,6 +199,8 @@ impl Root {
     }
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let input = cx.new(|cx| zeron_ui::composer::ComposerInput::new("Do anything…", cx));
+        let input_events = cx.subscribe(&input, Self::on_input);
         let text = window.text_system();
         let _ = text.add_fonts(vec![
             std::borrow::Cow::Borrowed(
@@ -250,6 +256,9 @@ impl Root {
             slider: Default::default(),
             sliding: false,
             chip_label: String::new(),
+            input,
+            synced: String::new(),
+            _input_events: input_events,
             hit_area: HitArea::default(),
             advances: Default::default(),
             _tick: tick,
@@ -281,7 +290,42 @@ impl Root {
         })
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    /// zeron's input changed, sent, or pasted something.
+    fn on_input(
+        &mut self,
+        input: gpui::Entity<zeron_ui::composer::ComposerInput>,
+        event: &zeron_ui::composer::ComposerInputEvent,
+        cx: &mut Context<Self>,
+    ) {
+        use zeron_ui::composer::ComposerInputEvent as Event;
+        let text = input.read(cx).text().to_string();
+        match event {
+            Event::Edited => {
+                self.chat.set_input(&text);
+                self.synced = text;
+            }
+            Event::Submitted | Event::ModifiedSubmitted => {
+                self.chat.set_input(&text);
+                let outcome = self.chat.key(Key::Enter, Mods::default());
+                self.apply(outcome, cx);
+            }
+            Event::PastedImages(images) => {
+                for image in images {
+                    self.chat.attach_image(image.bytes().to_vec(), "clipboard");
+                }
+            }
+            Event::PastedPaths(paths) => {
+                let text: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                self.chat.paste(&text.join("\n"));
+            }
+            _ => return,
+        }
+        cx.notify();
+    }
+
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // zeron's input has the typing keys; the chat still takes shortcuts.
+        let input_focused = self.input.read(cx).focus_handle(cx).is_focused(window);
         let stroke = &event.keystroke;
         let modifiers = &stroke.modifiers;
         let mods = Mods {
@@ -310,12 +354,23 @@ impl Root {
                 Some(c) if stroke.key.chars().count() == 1 => Key::Char(c),
                 _ => return,
             },
+            _ if input_focused => return,
             // Typed text: key_char carries shift and layout (e.g. "A", "ß").
             _ => match stroke.key_char.as_deref().and_then(|s| s.chars().next()) {
                 Some(c) if !c.is_control() => Key::Char(c),
                 _ => return,
             },
         };
+        // Editing keys belong to the input while it has focus.
+        let shortcut = mods.ctrl
+            || mods.alt
+            || matches!(key, Key::Esc | Key::F(_) | Key::PageUp | Key::PageDown)
+            || (key == Key::Tab && mods.shift);
+        if input_focused
+            && (!shortcut || (mods.ctrl && matches!(key, Key::Char('v' | 'c' | 'x' | 'a' | 'z'))))
+        {
+            return;
+        }
         let zoom = match key {
             Key::Char('=' | '+') if mods.ctrl => Some(self.zoom * ZOOM_STEP),
             Key::Char('-') if mods.ctrl => Some(self.zoom / ZOOM_STEP),
@@ -386,11 +441,8 @@ impl Root {
         }
         let (cell, line) = (f32::from(self.cell()), self.line());
         if y >= area.composer.1 {
-            // The card shows the row from the column's start; the chat counts
-            // cells from window column 0.
-            let col = ((x - area.composer.0) / cell).max(0.) as usize + area.column_start;
-            let row = area.first_input + ((y - area.composer.1) / line).max(0.) as usize;
-            return Some((row, col));
+            // The composer is zeron's input; it handles its own pointer.
+            return None;
         }
         let col = ((x - self.origin.0) / cell).max(0.) as usize;
         let row = (((y - self.origin.1) / line).max(0.) as usize).min(area.above.saturating_sub(1));
@@ -416,13 +468,7 @@ impl Root {
             cx.notify();
             return;
         }
-        // In the composer: the byte under the pointer in proportional text.
-        if let Some((row, at)) = self.text_at(event.position.x, event.position.y, window) {
-            self.chat
-                .click_text(row, at, event.click_count, event.modifiers.shift);
-            cx.notify();
-            return;
-        }
+
         let Some((row, col)) = self.cell_at(event.position.x, event.position.y) else {
             return;
         };
@@ -452,8 +498,8 @@ impl Root {
             cx.notify();
             return;
         }
-        let changed = match self.text_at(event.position.x, event.position.y, window) {
-            Some((row, at)) => self.chat.drag_text(row, at),
+        let changed = match None::<(usize, usize)> {
+            Some(_) => false,
             None => match self.cell_at(event.position.x, event.position.y) {
                 Some((row, col)) => {
                     let col = if row < self.hit_area.above {
@@ -472,34 +518,6 @@ impl Root {
         }
     }
 
-    /// Screen row and byte offset (within that row's text) under a point in
-    /// the composer, measured with the sans glyph advances.
-    fn text_at(&self, x: Pixels, y: Pixels, window: &Window) -> Option<(usize, usize)> {
-        let (x, y) = (f32::from(x), f32::from(y));
-        let area = self.hit_area;
-        if y < area.composer.1 || y > area.bottom || x < area.left {
-            return None;
-        }
-        let row = area.first_input + ((y - area.composer.1) / self.line()).max(0.) as usize;
-        let row = row.min(area.last_input);
-        let (start, end) = self.chat.input_span(row)?;
-        let text = &self.chat.input_text()[start..end];
-        let measure = self.measure(window);
-        let cell = f32::from(self.cell());
-        // The window's prompt rows have no marker: text starts at the edge.
-        let mut left = area.composer.0;
-        for (at, ch) in text.char_indices() {
-            let width = measure(ch.encode_utf8(&mut [0; 4]), Face::Sans, false) * cell;
-            if x < left + width / 2. {
-                return Some((row, at));
-            }
-            left += width;
-        }
-        Some((row, text.len()))
-    }
-
-    /// Selecting text puts it on the primary selection (middle-click paste),
-    /// like every Linux app.
     fn on_release(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.sliding) {
             cx.notify();
@@ -1555,8 +1573,21 @@ fn welcome(info: &Welcome, m: Metrics, cx: &mut Context<Root>) -> impl IntoEleme
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.focus.is_focused(window) {
-            window.focus(&self.focus, cx);
+        // The input has focus unless a list is open (the chat takes keys).
+        let input_focus = self.input.read(cx).focus_handle(cx);
+        if self.chat.in_picker() || self.chat.effort_panel_open() {
+            if !self.focus.is_focused(window) {
+                window.focus(&self.focus, cx);
+            }
+        } else if !input_focus.contains_focused(window, cx) {
+            window.focus(&input_focus, cx);
+        }
+        // The chat changed the prompt itself (sent, a starter, rewind): show it.
+        if self.chat.input_text() != self.synced {
+            let text = self.chat.input_text().to_string();
+            self.input
+                .update(cx, |input, cx| input.set_text(text.clone(), cx));
+            self.synced = text;
         }
         let z = self.zoom;
         let m = Metrics {
@@ -1617,7 +1648,6 @@ impl Render for Root {
         // and the composer's first text row (its card's border and padding).
         self.origin = (sidebar_w + m.pad, HEADER * z + m.pad / 2.);
         let above = frame.rule;
-        let first_input = frame.composer.start;
         let chip_rows = usize::from(frame.chips.is_some());
         let column = frame.column.clone();
         self.hit_area = HitArea {
@@ -1634,9 +1664,6 @@ impl Render for Root {
                     + (PILL_PAD + (PILL_BUTTON - LINE_HEIGHT) / 2.) * z
                     + chip_rows as f32 * m.line,
             ),
-            first_input,
-            last_input: frame.composer.end.saturating_sub(1),
-            column_start: column.start,
         };
         let head = chrome.as_ref().map(|chrome| header(chrome, m, cx));
         // The dialog covers the whole window (sidebar and title bar too).
@@ -1660,6 +1687,7 @@ impl Render for Root {
             columns as usize,
             &hover,
             self.slider.clone(),
+            self.input.clone(),
             cx,
         );
         let side = (sidebar_w > 1.)
@@ -1719,6 +1747,7 @@ fn chat_body(
     window_cols: usize,
     hover: &dyn Fn(&str) -> f32,
     slider: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    input: gpui::Entity<zeron_ui::composer::ComposerInput>,
     cx: &mut Context<Root>,
 ) -> gpui::AnyElement {
     let z = m.zoom;
@@ -1734,7 +1763,7 @@ fn chat_body(
         popup: dialog,
         pictures,
         dock,
-        composer,
+        composer: _,
         chips,
         content,
         column,
@@ -1813,7 +1842,6 @@ fn chat_body(
     let chip_rows = chips
         .map(|at| inside(at..at + 1, &below))
         .unwrap_or_default();
-    let input_rows = inside(composer.clone(), &below);
 
     // The composer sits under the reading column, as wide as it.
     let column_left = m.cell * column.start as f32;
@@ -1951,7 +1979,7 @@ fn chat_body(
                 .flex()
                 .flex_col()
                 .children(chip_rows)
-                .children(input_rows),
+                .child(input),
         )
         .children(chip)
         .child(div().w(px(2. * z)))
@@ -2319,12 +2347,49 @@ fn effort_panel(
         .child(slide)
 }
 
+/// zeron's globals its input and markdown read: settings, fonts, theme,
+/// and the composer's key bindings. Its data lives under shroom's.
+fn zeron_init(cx: &mut App) {
+    use zeron_ui::{appearance, composer, settings, theme_library, typography};
+    gpui_base::init(cx);
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".local/share"))
+        })
+        .unwrap_or_default()
+        .join("shroom/zeron");
+    let prefs = settings::UiSettings::default();
+    settings::init(prefs.clone(), data.clone(), cx);
+    let fonts = typography::register_fonts(cx);
+    typography::init(
+        prefs.ui_font_family.clone(),
+        prefs.ui_font_size,
+        prefs.terminal_font_family.clone(),
+        prefs.terminal_font_size,
+        prefs.code_font_family.clone(),
+        prefs.code_font_size,
+        fonts,
+        cx,
+    );
+    theme_library::init(data, cx);
+    appearance::init(
+        appearance::AppearanceMode::Dark,
+        prefs.theme_selection,
+        prefs.accent,
+        prefs.surface,
+        cx,
+    );
+    composer::init(cx, prefs.composer_send_behavior);
+}
+
 fn main() {
     if std::env::args().any(|arg| arg == "--version") {
         println!("shroom {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     application().run(|cx: &mut App| {
+        zeron_init(cx);
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
         let opened = cx.open_window(
             WindowOptions {
