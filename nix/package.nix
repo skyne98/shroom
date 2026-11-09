@@ -19,6 +19,7 @@
   wayland,
   vulkan-loader,
   libglvnd,
+  openssl,
   git,
   bash,
 }:
@@ -84,7 +85,9 @@ rustPlatform.buildRustPackage {
     makeWrapper
     copyDesktopItems
   ];
-  buildInputs = runtimeLibs;
+  # The cargo setup hook exports OPENSSL_NO_VENDOR=1, so crates that want
+  # openssl (zeron's, extism's) link the system one instead of vendoring.
+  buildInputs = runtimeLibs ++ [ openssl ];
 
   desktopItems = [
     (makeDesktopItem {
