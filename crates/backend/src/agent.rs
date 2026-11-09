@@ -21,9 +21,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::compact::{self, Compactor, Summarizer};
 
-/// Tool loop guard: models that keep calling tools get cut off, not looped forever.
-const MAX_TURNS: usize = 24;
-
 /// Program output kept in the conversation; anything longer is saved to a
 /// file and the model gets its head, tail and the path. Output is never
 /// changed after it is sent: rewriting history breaks the prompt cache, and a
@@ -133,7 +130,9 @@ pub struct Agent {
     /// Messages to steer the run: each becomes a user turn between model
     /// turns, and keeps the run going if it was about to end.
     pub inbox: Inbox,
-    pub max_turns: usize,
+    /// Tool rounds after which a run is cut off. `None` (the main agent):
+    /// it works until it answers. Subagents set their own cap (16).
+    pub max_turns: Option<usize>,
     /// Extra functions for the `js` tool (subagents).
     pub host: Option<Arc<dyn shroom_js::Host>>,
     /// `write`/`edit` refuse.
@@ -211,7 +210,7 @@ impl Agent {
             summarizers: Vec::new(),
             compactor: Arc::default(),
             inbox: Inbox::default(),
-            max_turns: MAX_TURNS,
+            max_turns: None,
             host: None,
             read_only: false,
             confine: false,
@@ -313,7 +312,9 @@ impl Agent {
 
         // Messages queued before the run started go first.
         self.steer(messages, updates);
-        for turns in 1..=self.max_turns {
+        let mut turns = 0;
+        loop {
+            turns += 1;
             let reply = self.call(messages, updates, cancel).await?;
             usage.input += reply.usage.input;
             usage.output += reply.usage.output;
@@ -365,15 +366,19 @@ impl Agent {
                 return Err(cancelled());
             }
             self.steer(messages, updates);
+            // Only turns that asked for more work get here, so the cap never
+            // cuts off a run that had just finished.
+            if let Some(max) = self.max_turns
+                && turns >= max
+            {
+                return Err(Error::new(
+                    Kind::Other,
+                    format!(
+                        "stopped after {max} tool rounds without a final answer · say \"continue\" to keep going"
+                    ),
+                ));
+            }
         }
-
-        Err(Error::new(
-            Kind::Other,
-            format!(
-                "stopped after {} tool rounds without a final answer · say \"continue\" to keep going",
-                self.max_turns
-            ),
-        ))
     }
 
     /// What one model call sends.

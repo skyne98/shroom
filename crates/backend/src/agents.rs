@@ -524,7 +524,7 @@ impl Agents {
                     agent.cache_key = Some(format!("shroom-{scope}-agents"));
                     agent.read_only = !info.write;
                     agent.confine = worktree.is_some();
-                    agent.max_turns = CHILD_TURNS;
+                    agent.max_turns = Some(CHILD_TURNS);
                     agent
                 }
                 None => {
