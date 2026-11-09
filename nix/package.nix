@@ -64,6 +64,8 @@ rustPlatform.buildRustPackage {
       "zed-font-kit-0.14.1-zed" = "sha256-KXygi0olNQi5yM8eaJVykNDtbPMDjT+cWPBF8UrtXR4=";
       "zed-scap-0.0.8-zed" = "sha256-BihiQHlal/eRsktyf0GI3aSWsUCW7WcICMsC2Xvb7kw=";
       "gpui-base-0.5.2" = "sha256-0AY0tuhP8Jc6JXDitmXPReOvzWVnim2KY1rll9Qs2xA=";
+      # One repo: zatex, zeron-ui, zeron-markdown, … (the desktop's text).
+      "zatex-0.2.130" = "sha256-IBL2J3pvPKsH5IT3SGf1Ks4JeGhjMNnXJM/yxBPNWYk=";
     };
   };
 
