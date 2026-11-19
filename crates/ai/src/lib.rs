@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod catalog;
+pub mod claude;
 mod faux;
 pub mod image;
 
@@ -518,6 +519,8 @@ pub struct Model {
     /// (size, format, file), decided per request: the conversation keeps
     /// the images for a model that can see them.
     pub(crate) vision: bool,
+    /// Anthropic through the Claude subscription login (see [`claude`]).
+    claude: bool,
 }
 
 impl Model {
@@ -529,6 +532,7 @@ impl Model {
             cache_key: matches!(adapter, AdapterKind::OpenAI | AdapterKind::OpenAIResp),
             reasoning_passback: false,
             vision: true,
+            claude: false,
         }
     }
 
@@ -536,8 +540,13 @@ impl Model {
         Self::any(AdapterKind::OpenAI, id)
     }
 
+    /// Through the Claude subscription when logged in (or given a
+    /// subscription token), else with `ANTHROPIC_API_KEY`.
     pub fn anthropic(id: impl Into<String>) -> Self {
-        Self::any(AdapterKind::Anthropic, id)
+        Self {
+            claude: claude::active(),
+            ..Self::any(AdapterKind::Anthropic, id)
+        }
     }
 
     pub fn gemini(id: impl Into<String>) -> Self {
@@ -563,6 +572,7 @@ impl Model {
             reasoning_passback: false,
             vision: true,
             cache_key: false,
+            claude: false,
         }
     }
 
@@ -583,6 +593,7 @@ impl Model {
             reasoning_passback: false,
             vision: true,
             cache_key: false,
+            claude: false,
         }
     }
 
@@ -655,6 +666,10 @@ impl Client {
     pub fn stream(&self, model: &Model, ctx: &Context) -> EventStream {
         let client = self.inner.clone();
         let spec = model.spec.clone();
+        let claude = match (&spec, model.claude) {
+            (ModelSpec::Iden(iden), true) => Some(iden.clone()),
+            _ => None,
+        };
         let price = model.price;
         let request = request(ctx, model);
         let mut options = ChatOptions::default()
@@ -675,6 +690,17 @@ impl Client {
         }
 
         Box::pin(async_stream::stream! {
+            // The subscription token may need a refresh: fetched per call.
+            let spec = match claude {
+                Some(iden) => match claude::target(iden).await {
+                    Ok(target) => ModelSpec::Target(target),
+                    Err(err) => {
+                        yield Err(Error::new(Kind::Auth, err));
+                        return;
+                    }
+                },
+                None => spec,
+            };
             let response = match client.exec_chat_stream(spec, request, Some(&options)).await {
                 Ok(response) => response,
                 Err(err) => {
@@ -769,6 +795,12 @@ fn request(ctx: &Context, model: &Model) -> ChatRequest {
     // the next call (the same messages plus a few) reads it back. Providers
     // that cache on their own (DeepSeek, Gemini, older OpenAI) ignore them.
     let mark = || genai::chat::MessageOptions::from(genai::chat::CacheControl::Ephemeral);
+    // Subscription tokens are only served to Claude Code: its identity first.
+    if model.claude {
+        messages.push(ChatMessage::system(MessageContent::from_text(
+            claude::IDENTITY,
+        )));
+    }
     if let Some(system) = &ctx.system {
         messages.push(
             ChatMessage::system(MessageContent::from_text(system.as_str())).with_options(mark()),
@@ -1046,6 +1078,7 @@ impl Accum {
             reasoning_passback: false,
             vision: true,
             cache_key: false,
+            claude: false,
         }
         .cost(self.usage);
         events.push(Event::Done {
@@ -1236,6 +1269,20 @@ mod tests {
             flags,
             [true, false, false, true],
             "system + last only (Anthropic allows 4)"
+        );
+        // The Claude subscription: Claude Code's identity leads the system prompt.
+        let claude = Model {
+            claude: true,
+            ..Model::any(AdapterKind::Anthropic, "m")
+        };
+        let built = request(&ctx, &claude);
+        assert_eq!(
+            built.messages[0].content.joined_texts().as_deref(),
+            Some(claude::IDENTITY)
+        );
+        assert_eq!(
+            built.messages[1].content.joined_texts().as_deref(),
+            Some("sys")
         );
         let empty = request(&Context::new().system("sys"), &Model::openai("m"));
         assert_eq!(empty.messages.len(), 1);

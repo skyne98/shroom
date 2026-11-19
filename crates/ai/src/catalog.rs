@@ -54,7 +54,7 @@ impl Entry {
     }
 
     pub fn available(&self) -> bool {
-        self.key_env().is_some()
+        self.key_env().is_some() || (self.provider == "anthropic" && crate::claude::active())
     }
 
     /// A ready-to-call model: native genai adapter where one exists,
@@ -67,6 +67,7 @@ impl Entry {
             _ => None,
         };
         let mut model = match (native, &self.api) {
+            (Some(AdapterKind::Anthropic), _) => Model::anthropic(self.id.clone()),
             (Some(kind), _) => Model::any(kind, self.id.clone()),
             (None, Some(api)) => {
                 let base = if api.ends_with('/') {

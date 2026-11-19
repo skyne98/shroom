@@ -66,7 +66,7 @@ pub enum Outcome {
     Quit,
     /// Put this text on the system clipboard (each client has its own way).
     Copy(String),
-    /// Show this image full size (the system image viewer).
+    /// Open this with the system (an image in its viewer, a URL in the browser).
     Open(PathBuf),
 }
 
@@ -565,7 +565,7 @@ fn one_line(text: &str) -> String {
 
 /// Percent of the prompt tokens read from the provider's cache.
 fn cached_share(usage: &Usage) -> Option<f64> {
-    (usage.input > 0).then(|| 100.0 * usage.cache_read as f64 / usage.input as f64)
+    (usage.input > 0).then_some(100.0 * usage.cache_read as f64 / usage.input as f64)
 }
 
 /// A session as the lists show it.
@@ -575,6 +575,16 @@ struct SessionInfo {
     turns: usize,
     /// Last change (its file's modification time).
     used: Option<std::time::SystemTime>,
+}
+
+/// `/home/fox/x` → `--home-fox-x--`: a working directory's folder name for
+/// its sessions (pi's scheme).
+fn project_key(cwd: &std::path::Path) -> String {
+    let path = cwd.to_string_lossy();
+    format!(
+        "--{}--",
+        path.trim_start_matches('/').replace(['/', '\\', ':'], "-")
+    )
 }
 
 /// `untitled-12`: the name a session has until it gets a real one.
@@ -1239,6 +1249,7 @@ enum Command {
     Rewind,
     Help,
     ApiKey,
+    ClaudeLogin,
     Sidebar,
     Session(DocId),
 }
@@ -1270,8 +1281,11 @@ pub struct Chat {
     live: Vec<Segment>,
     live_doc: Option<DocId>,
     cancel: Option<CancellationToken>,
-    /// The data directory (conversations live under it).
+    /// The data directory: settings, keys, images, extensions.
     data_dir: PathBuf,
+    /// This working directory's sessions, with their conversations,
+    /// checkpoints and subagents (as in pi: sessions belong to a folder).
+    project: PathBuf,
     /// Exact conversations (with tool calls and results) since this start,
     /// per session; sessions not here are rebuilt from their stored text.
     conversations: HashMap<DocId, Vec<Message>>,
@@ -1296,12 +1310,18 @@ pub struct Chat {
     rewind_at: Option<usize>,
     /// When esc was last pressed on an empty box (twice opens rewind).
     last_esc: Option<std::time::Instant>,
+    /// When ctrl+c last cleared the box: a second one soon after quits.
+    last_ctrl_c: Option<std::time::Instant>,
     /// The transcript changed in place (a rewind): fade it in as a whole.
     refade: bool,
     /// The provider refused the key: offer the key field (ctrl+k).
     key_wanted: bool,
     /// The key variable the open key field sets.
     entering_key: Option<String>,
+    /// A Claude login waiting for its code (the key field takes it), and
+    /// the token exchange in flight.
+    claude_login: Option<Arc<shroom_ai::claude::Login>>,
+    claude_done: Option<Receiver<Result<(), String>>>,
     /// The last frame showed the welcome.
     was_welcome: bool,
     /// Column names of the model list.
@@ -1375,24 +1395,30 @@ pub struct Chat {
 }
 
 impl Chat {
-    /// Open the default data dir: documents, session log, extensions, agent.
+    /// Open the default data dir, with the sessions of the working directory.
     pub fn open() -> Self {
-        Self::open_in(Files::default_dir())
+        let dir = Files::default_dir();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let project = dir.join("projects").join(project_key(&cwd));
+        Self::open_at(dir, project)
     }
 
-    /// [`Chat::open`] on another data directory (tests).
+    /// [`Chat::open`] on another data directory, sessions kept in it (tests).
     pub fn open_in(dir: PathBuf) -> Self {
-        let root = dir.clone();
+        Self::open_at(dir.clone(), dir)
+    }
+
+    fn open_at(dir: PathBuf, project: PathBuf) -> Self {
         let ext = shroom_ext::Ext::load_dir(dir.join("extensions"));
         let hooks: Box<dyn shroom_core::Hooks> =
             match shroom_session::Session::create(dir.join("sessions")) {
                 Ok(session) => Box::new((session, ext)),
                 Err(_) => Box::new(ext),
             };
-        let mut client = Client::with_hooks(Files::new(dir), hooks);
+        let mut client = Client::with_hooks(Files::new(&project), hooks);
         client.start();
         crate::highlight::warm();
-        let dir = root;
+        shroom_ai::claude::set_store(dir.join("claude.json"));
         load_keys(&dir);
         let settings_path = dir.join("settings.json");
         let settings = Settings::load(&settings_path);
@@ -1400,7 +1426,11 @@ impl Chat {
         let (prepare_tx, preparing) = mpsc::channel();
         let mut chat = Self {
             client,
-            worker: Worker::spawn(compactor.clone(), dir.join("agents"), dir.join("images")),
+            worker: Worker::spawn(
+                compactor.clone(),
+                project.join("agents"),
+                dir.join("images"),
+            ),
             compactor,
             context: HashMap::new(),
             steer: None,
@@ -1417,6 +1447,7 @@ impl Chat {
             cancel: None,
             conversations: HashMap::new(),
             data_dir: dir.clone(),
+            project,
             usage: Usage::default(),
             catalog: Catalog::default(),
             catalogs: catalog_feed(dir.join("models.json")),
@@ -1430,9 +1461,12 @@ impl Chat {
             bars_hovered: [false; 3],
             rewind_at: None,
             last_esc: None,
+            last_ctrl_c: None,
             refade: false,
             key_wanted: false,
             entering_key: None,
+            claude_login: None,
+            claude_done: None,
             was_welcome: false,
             model_header: String::new(),
             column: COLUMN,
@@ -2050,6 +2084,14 @@ impl Chat {
             self.catalog = catalog;
             changed = true;
         }
+        if let Some(Ok(result)) = self.claude_done.as_ref().map(Receiver::try_recv) {
+            self.claude_done = None;
+            self.notice = Some(match result {
+                Ok(()) => "✓ logged in to Claude · ctrl+l picks a Claude model".into(),
+                Err(err) => format!("Claude login failed: {err}"),
+            });
+            changed = true;
+        }
         // Asked for the model list while it was loading: here it is.
         if self.models_wanted && !self.catalog.entries.is_empty() {
             self.models_wanted = false;
@@ -2434,7 +2476,7 @@ impl Chat {
     }
 
     fn conversation_path(&self, doc: DocId) -> PathBuf {
-        self.data_dir
+        self.project
             .join("conversations")
             .join(format!("{doc}.json"))
     }
@@ -2559,14 +2601,24 @@ impl Chat {
         if mods.ctrl {
             match key {
                 Key::Char('q') => return Outcome::Quit,
+                // Copies a selection; else clears the box, and twice quits (as in pi).
                 Key::Char('c') => {
-                    return match self.selected_text() {
-                        Some(text) if self.mode == Mode::Chat => self.copied(text),
-                        _ => {
-                            self.notice = Some("nothing selected · ctrl+q quits".into());
-                            Outcome::Redraw
-                        }
-                    };
+                    if let Some(text) = self.selected_text().filter(|_| self.mode == Mode::Chat) {
+                        return self.copied(text);
+                    }
+                    let now = std::time::Instant::now();
+                    if self.last_ctrl_c.is_some_and(|then| {
+                        now.duration_since(then) < std::time::Duration::from_secs(1)
+                    }) {
+                        return Outcome::Quit;
+                    }
+                    self.last_ctrl_c = Some(now);
+                    if self.mode == Mode::Chat && !self.editor.is_empty() {
+                        self.editor.select_all();
+                        self.editor.cut();
+                    }
+                    self.notice = Some("ctrl+c again to quit".into());
+                    return Outcome::Redraw;
                 }
                 Key::Char('y') => return self.copy_last_code(),
                 Key::Char('p') => {
@@ -2665,7 +2717,7 @@ impl Chat {
                 id: doc.id,
                 title: doc.title.clone(),
                 turns: count_turns(&doc.body),
-                used: std::fs::metadata(self.data_dir.join(format!("{}.json", doc.id)))
+                used: std::fs::metadata(self.project.join(format!("{}.json", doc.id)))
                     .and_then(|meta| meta.modified())
                     .ok(),
             })
@@ -2763,7 +2815,7 @@ impl Chat {
         let name: String = name.chars().take(80).collect();
         // Renaming isn't using: the session keeps its place in the list
         // (its file's time is what "used" reads).
-        let file = self.data_dir.join(format!("{id}.json"));
+        let file = self.project.join(format!("{id}.json"));
         let used = std::fs::metadata(&file)
             .and_then(|meta| meta.modified())
             .ok();
@@ -2996,6 +3048,7 @@ impl Chat {
             (Rewind, "Rewind to an earlier prompt…\tesc esc".into()),
             (Help, "Keys and symbols\tf1".into()),
             (ApiKey, "Enter an API key…\tctrl+k".into()),
+            (ClaudeLogin, "Log in to Claude (Pro/Max)…".into()),
             (Sidebar, "Show or hide the sidebar\tctrl+b".into()),
             (RenameSession, "Rename this session…\tf2".into()),
             (DeleteSession, "Delete this session…\tctrl+w".into()),
@@ -3055,6 +3108,7 @@ impl Chat {
             Command::Rewind => self.open_rewind(),
             Command::Help => self.open_help(),
             Command::ApiKey => self.open_key(),
+            Command::ClaudeLogin => return self.open_claude_login(),
             Command::Sidebar => self.toggle_sidebar(),
             Command::Session(id) => {
                 self.dispatch(Action::Select(id));
@@ -3082,7 +3136,7 @@ impl Chat {
             ("Show or hide the sidebar (window)", "ctrl+b"),
             ("Copy the last code block", "ctrl+y"),
             ("Zoom in, out, reset (window)", "ctrl+= ctrl+- ctrl+0"),
-            ("Quit", "ctrl+q"),
+            ("Quit", "ctrl+q · ctrl+c twice"),
             ("▸ finished work, folded: click opens", "▸"),
             ("✓ ✗ a tool call succeeded or failed", "✓ ✗"),
             ("◆ a subagent: a separate run working on a subtask", "◆"),
@@ -3133,10 +3187,50 @@ impl Chat {
         self.mode = Mode::Picker;
     }
 
+    /// Sign in to a Claude subscription, as pi's `/login anthropic`: the
+    /// browser opens the sign-in page, the key field takes the code it shows.
+    fn open_claude_login(&mut self) -> Outcome {
+        let login = match shroom_ai::claude::login() {
+            Ok(login) => login,
+            Err(err) => {
+                self.notice = Some(err);
+                return Outcome::Redraw;
+            }
+        };
+        let url = PathBuf::from(&login.url);
+        self.claude_login = Some(Arc::new(login));
+        self.open_key();
+        Outcome::Open(url)
+    }
+
+    /// Trade the pasted code for tokens off the UI thread; `poll` reports.
+    fn finish_claude_login(&mut self, login: Arc<shroom_ai::claude::Login>, code: String) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| err.to_string())
+                .and_then(|runtime| runtime.block_on(login.finish(&code)));
+            let _ = tx.send(result);
+        });
+        self.claude_done = Some(rx);
+        self.notice = Some("◌ logging in to Claude…".into());
+    }
+
     fn key_field(&mut self, key: Key, ctrl: bool) {
         match key {
             Key::Enter => {
                 let value = self.picker.query.trim().to_string();
+                if let Some(login) = self.claude_login.take() {
+                    self.entering_key = None;
+                    if !value.is_empty() {
+                        self.finish_claude_login(login, value);
+                    }
+                    self.picker.clear();
+                    self.mode = Mode::Chat;
+                    return;
+                }
                 if let Some(name) = self.entering_key.take()
                     && !value.is_empty()
                 {
@@ -3150,6 +3244,7 @@ impl Chat {
             }
             Key::Esc => {
                 self.entering_key = None;
+                self.claude_login = None;
                 self.picker.clear();
                 self.mode = Mode::Chat;
             }
@@ -3390,7 +3485,7 @@ impl Chat {
 
     /// Where session `doc`'s rewind marks and file snapshots are kept.
     fn checkpoints(&self, doc: DocId) -> PathBuf {
-        self.data_dir.join("checkpoints").join(doc.to_string())
+        self.project.join("checkpoints").join(doc.to_string())
     }
 
     /// The session's prompts, newest first, each with how many files its
@@ -3566,7 +3661,7 @@ impl Chat {
         let _ = std::fs::remove_file(self.conversation_path(id));
         // ponytail: subagents still running keep going and may save once
         // more; stop them through the worker if that ever matters.
-        let _ = std::fs::remove_dir_all(self.data_dir.join("agents").join(id.to_string()));
+        let _ = std::fs::remove_dir_all(self.project.join("agents").join(id.to_string()));
         let _ = std::fs::remove_dir_all(self.checkpoints(id));
         self.dispatch(Action::Close(id));
         if self.client.app().selected().is_none() {
@@ -4507,12 +4602,15 @@ impl Chat {
             let name = self.entering_key.clone().unwrap_or_default();
             // Shown as dots: a key on screen ends up in screenshots.
             let hidden = "•".repeat(self.picker.query.chars().count());
-            return Some(popup::field(
-                format!("api key · {name}"),
-                &hidden,
-                "paste the key, enter saves it",
-                width,
-            ));
+            let (title, hint) = if self.claude_login.is_some() {
+                (
+                    "log in to Claude".to_string(),
+                    "sign in in the browser, paste the code it shows",
+                )
+            } else {
+                (format!("api key · {name}"), "paste the key, enter saves it")
+            };
+            return Some(popup::field(title, &hidden, hint, width));
         }
         (self.mode == Mode::Picker).then(|| {
             // Grid clients show whole rows; pixel clients slide the rows by
@@ -6190,6 +6288,48 @@ mod key_tests {
 
     fn sessions(chat: &Chat) -> Vec<u64> {
         chat.client.app().docs().iter().map(|doc| doc.id).collect()
+    }
+
+    #[test]
+    fn ctrl_c_clears_the_box_then_quits() {
+        let (mut chat, dir) = chat();
+        typed(&mut chat, "draft");
+        assert_eq!(chat.key(Key::Char('c'), CTRL), Outcome::Redraw);
+        assert!(chat.editor.is_empty(), "first ctrl+c clears the box");
+        assert_eq!(chat.notice.as_deref(), Some("ctrl+c again to quit"));
+        assert_eq!(chat.key(Key::Char('c'), CTRL), Outcome::Quit);
+        chat.key(Key::Char('z'), CTRL);
+        assert_eq!(chat.editor.text(), "draft", "the clear is undoable");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sessions_belong_to_their_working_directory() {
+        assert_eq!(
+            super::project_key(std::path::Path::new("/home/fox/x")),
+            "--home-fox-x--"
+        );
+        let (chat, dir) = chat();
+        drop(chat);
+        let (a, b) = (dir.join("projects/a"), dir.join("projects/b"));
+        std::fs::create_dir_all(&a).unwrap();
+        let body = serde_json::to_string(&crate::user_turn("only in a")).unwrap();
+        std::fs::write(
+            a.join("5.json"),
+            format!(r#"{{"id":5,"title":"alpha","body":{body}}}"#),
+        )
+        .unwrap();
+        let titles = |chat: &Chat| -> Vec<String> {
+            chat.client
+                .app()
+                .docs()
+                .iter()
+                .map(|d| d.title.clone())
+                .collect()
+        };
+        assert_eq!(titles(&Chat::open_at(dir.clone(), a)), ["alpha"]);
+        assert!(!titles(&Chat::open_at(dir.clone(), b)).contains(&"alpha".into()));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
