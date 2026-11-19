@@ -20,6 +20,23 @@
   vulkan-loader,
   libglvnd,
   openssl,
+  zstd,
+  libgit2,
+  sqlite,
+  oniguruma,
+  zlib,
+  alsa-lib,
+  atk,
+  cairo,
+  dbus-glib,
+  gdk-pixbuf,
+  glib,
+  gtk3,
+  libsoup_3,
+  webkitgtk_4_1,
+  json-glib,
+  dbus,
+  onnxruntime,
   git,
   bash,
 }:
@@ -85,9 +102,35 @@ rustPlatform.buildRustPackage {
     makeWrapper
     copyDesktopItems
   ];
-  # The cargo setup hook exports OPENSSL_NO_VENDOR=1, so crates that want
-  # openssl (zeron's, extism's) link the system one instead of vendoring.
-  buildInputs = runtimeLibs ++ [ openssl ];
+  # The cargo setup hook in current nixpkgs sets OPENSSL_NO_VENDOR,
+  # ZSTD_SYS_USE_PKG_CONFIG, LIBGIT2_NO_VENDOR, RUSTONIG_SYSTEM_LIBONIG,
+  # LIBZ_SYS_STATIC=0 and LIBSQLITE3_SYS_USE_PKG_CONFIG=1 for every cargo
+  # build, so c-* crates link these instead of vendoring them.
+  # zeron-voice's ort-sys downloads ONNX Runtime in its build script, which
+  # the sandbox forbids; link the system one instead.
+  env.ORT_LIB_LOCATION = "${onnxruntime}";
+  env.ORT_PREFER_DYNAMIC_LINK = "1";
+
+  buildInputs = runtimeLibs ++ [
+    onnxruntime
+    openssl
+    zstd
+    libgit2
+    sqlite
+    oniguruma
+    zlib
+    alsa-lib
+    atk
+    cairo
+    dbus-glib
+    gdk-pixbuf
+    glib
+    gtk3
+    libsoup_3
+    webkitgtk_4_1
+    json-glib
+    dbus
+  ];
 
   desktopItems = [
     (makeDesktopItem {
