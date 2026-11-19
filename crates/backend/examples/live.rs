@@ -1,6 +1,7 @@
 //! One live run against a real provider, printing thinking, text and tool calls.
 //!
 //!   DEEPSEEK_API_KEY=... cargo run -p shroom-backend --example live -- "your question" [effort]
+//!   SHROOM_LIVE_MODEL=anthropic/claude-haiku-4-5 ... (key or Claude login)
 
 use shroom_ai::{Effort, Message, Model};
 use shroom_backend::{Agent, Update};
@@ -14,7 +15,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let effort = std::env::args()
         .nth(2)
         .and_then(|text| Effort::parse(&text));
-    let agent = Agent::new(Model::deepseek("deepseek-flash")).effort(effort);
+    let model = match std::env::var("SHROOM_LIVE_MODEL").ok().as_deref() {
+        Some(key) if key.starts_with("anthropic/") => Model::anthropic(&key["anthropic/".len()..]),
+        _ => Model::deepseek("deepseek-flash"),
+    };
+    let agent = Agent::new(model).effort(effort);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let printer = tokio::spawn(async move {
