@@ -53,8 +53,12 @@ impl Entry {
             .map(String::as_str)
     }
 
+    /// A key is set, or the provider takes none (`env` empty: a local
+    /// server from providers.json).
     pub fn available(&self) -> bool {
-        self.key_env().is_some() || (self.provider == "anthropic" && crate::claude::active())
+        self.env.is_empty()
+            || self.key_env().is_some()
+            || (self.provider == "anthropic" && crate::claude::active())
     }
 
     /// A ready-to-call model: native genai adapter where one exists,
@@ -77,9 +81,10 @@ impl Entry {
                 };
                 let target = ServiceTarget {
                     endpoint: Endpoint::from_owned(base),
-                    auth: AuthData::from_env(
-                        self.key_env().or(self.env.first().map(String::as_str))?,
-                    ),
+                    auth: match self.key_env().or(self.env.first().map(String::as_str)) {
+                        Some(name) => AuthData::from_env(name),
+                        None => AuthData::from_single("none"),
+                    },
                     model: ModelIden::new(AdapterKind::OpenAI, self.id.clone()),
                 };
                 Model::from_target(target)
@@ -186,6 +191,15 @@ impl Catalog {
         Self::parse(&std::fs::read_to_string(cache).ok()?).ok()
     }
 
+    /// Plus the user's own providers at `path` (models.dev's format), e.g. a
+    /// local gateway; one without `env` takes no key.
+    pub fn with_local(mut self, path: &Path) -> Self {
+        if let Some(local) = Self::load(path) {
+            self.entries.extend(local.entries);
+        }
+        self
+    }
+
     pub fn stale(cache: &Path) -> bool {
         let modified = std::fs::metadata(cache).and_then(|meta| meta.modified());
         modified.map_or(true, |at| {
@@ -274,6 +288,30 @@ fn price(cost: &Value) -> Option<Price> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyless_local_providers_join_the_list() {
+        let dir = std::env::temp_dir().join(format!("shroom-local-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("providers.json");
+        std::fs::write(
+            &path,
+            r#"{"bifrost": {"name": "Bifrost", "api": "http://127.0.0.1:8099/openai/v1",
+                "models": {"pcai/m": {"tool_call": true, "limit": {"context": 1000}}}}}"#,
+        )
+        .unwrap();
+        let catalog = Catalog::default().with_local(&path);
+        let entry = catalog.find("bifrost/pcai/m").expect("listed");
+        assert!(entry.available(), "no key needed");
+        assert!(entry.model().is_some());
+        assert!(
+            Catalog::default()
+                .with_local(&dir.join("none.json"))
+                .entries
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     const SAMPLE: &str = r#"{
       "deepseek": { "id": "deepseek", "name": "DeepSeek", "env": ["SHROOM_TEST_NO_SUCH_KEY"],

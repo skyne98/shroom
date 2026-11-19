@@ -1,7 +1,7 @@
 //! One live run against a real provider, printing thinking, text and tool calls.
 //!
 //!   DEEPSEEK_API_KEY=... cargo run -p shroom-backend --example live -- "your question" [effort]
-//!   SHROOM_LIVE_MODEL=anthropic/claude-haiku-4-5 ... (key or Claude login)
+//!   SHROOM_LIVE_MODEL=anthropic/claude-haiku-4-5 ... (any provider/model the app lists)
 
 use shroom_ai::{Effort, Message, Model};
 use shroom_backend::{Agent, Update};
@@ -15,10 +15,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let effort = std::env::args()
         .nth(2)
         .and_then(|text| Effort::parse(&text));
-    let model = match std::env::var("SHROOM_LIVE_MODEL").ok().as_deref() {
-        Some(key) if key.starts_with("anthropic/") => Model::anthropic(&key["anthropic/".len()..]),
-        _ => Model::deepseek("deepseek-flash"),
-    };
+    // Any model the app lists (models.dev cache plus providers.json).
+    let dir = shroom_backend::Files::default_dir();
+    let catalog = shroom_ai::catalog::Catalog::load(&dir.join("models.json"))
+        .unwrap_or_default()
+        .with_local(&dir.join("providers.json"));
+    let model = std::env::var("SHROOM_LIVE_MODEL")
+        .ok()
+        .and_then(|key| catalog.find(&key)?.model())
+        .unwrap_or_else(|| Model::deepseek("deepseek-flash"));
     let agent = Agent::new(model).effort(effort);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

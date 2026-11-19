@@ -379,8 +379,11 @@ impl Worker {
 /// models.dev list: the disk cache at once, a fresh copy when it is stale.
 fn catalog_feed(cache: PathBuf) -> Receiver<Catalog> {
     let (tx, rx) = mpsc::channel();
+    // The user's own providers (a local gateway) join the list.
+    let local = cache.with_file_name("providers.json");
     thread::spawn(move || {
-        if let Some(catalog) = Catalog::load(&cache) {
+        let catalog = Catalog::load(&cache).unwrap_or_default().with_local(&local);
+        if !catalog.entries.is_empty() {
             let _ = tx.send(catalog);
         }
         if Catalog::stale(&cache)
@@ -389,7 +392,7 @@ fn catalog_feed(cache: PathBuf) -> Receiver<Catalog> {
                 .build()
             && let Ok(catalog) = runtime.block_on(Catalog::refresh(&cache))
         {
-            let _ = tx.send(catalog);
+            let _ = tx.send(catalog.with_local(&local));
         }
     });
     rx
