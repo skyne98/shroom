@@ -327,7 +327,9 @@ mod tests {
       "compat": { "id": "compat", "name": "Compat", "env": ["PATH"], "api": "https://x.test/v1",
         "models": { "m1": { "id": "m1", "tool_call": true, "reasoning": false,
           "modalities": {"input": ["text"], "output": ["text"]} },
-          "m2": { "id": "m2", "tool_call": true } } }
+          "m2": { "id": "m2", "tool_call": true },
+          "m3": { "id": "m3", "tool_call": true, "reasoning": true,
+            "reasoning_options": [{"type":"effort","values":["low","medium","xhigh"]}] } } }
     }"#;
 
     #[test]
@@ -336,7 +338,7 @@ mod tests {
         let keys: Vec<String> = catalog.entries.iter().map(Entry::key).collect();
         assert_eq!(
             keys,
-            ["compat/m1", "compat/m2", "deepseek/deepseek-flash"],
+            ["compat/m1", "compat/m2", "compat/m3", "deepseek/deepseek-flash"],
             "no tools / no endpoint skipped"
         );
         let flash = catalog.find("deepseek-flash").unwrap();
@@ -355,6 +357,13 @@ mod tests {
         );
         assert!(!flash.available(), "key not set");
 
+        // A template that takes low/medium/xhigh (Qwen 3.x shape): xhigh
+        // stays its own level and is the default (strongest below max).
+        let m3 = catalog.find("compat/m3").unwrap();
+        assert_eq!(m3.efforts, [Effort::Low, Effort::Medium, Effort::XHigh]);
+        assert_eq!(m3.default_effort(), Some(Effort::XHigh));
+        assert_eq!(m3.next_effort(Some(Effort::XHigh)), Some(Effort::Low));
+
         let compat = catalog.find("compat/m1").unwrap();
         assert!(compat.available(), "PATH is always set");
         assert!(compat.efforts.is_empty());
@@ -367,6 +376,6 @@ mod tests {
             catalog.find("compat/m2").unwrap().vision,
             "no modalities listed: assume it sees"
         );
-        assert_eq!(catalog.available().len(), 2);
+        assert_eq!(catalog.available().len(), 3);
     }
 }

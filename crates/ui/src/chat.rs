@@ -1638,6 +1638,7 @@ impl Chat {
                 Effort::Low,
                 Effort::Medium,
                 Effort::High,
+                Effort::XHigh,
                 Effort::Max,
             ],
         }
@@ -2539,7 +2540,8 @@ impl Chat {
         let next = match self.entry() {
             Some(entry) => entry.next_effort(self.effort()),
             None => Some(match self.effort() {
-                Some(Effort::High) => Effort::Max,
+                Some(Effort::High) => Effort::XHigh,
+                Some(Effort::XHigh) => Effort::Max,
                 Some(Effort::Max) => Effort::Off,
                 Some(Effort::Off) => Effort::Low,
                 _ => Effort::High,

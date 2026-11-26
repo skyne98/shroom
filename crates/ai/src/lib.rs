@@ -357,6 +357,9 @@ pub struct Context {
 
 /// How hard the model thinks. `Off` disables thinking where the provider
 /// supports a toggle (DeepSeek, Anthropic); levels map to the provider's own.
+/// `XHigh` is its own level (wire `"xhigh"`), distinct from `Max`
+/// (`"max"`): some chat templates accept one and not the other (Qwen 3.x
+/// accepts low/medium/xhigh and rejects max).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
@@ -364,6 +367,7 @@ pub enum Effort {
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -374,6 +378,7 @@ impl Effort {
             Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
+            Effort::XHigh => "xhigh",
             Effort::Max => "max",
         }
     }
@@ -384,7 +389,8 @@ impl Effort {
             "low" | "minimal" => Effort::Low,
             "medium" => Effort::Medium,
             "high" => Effort::High,
-            "max" | "xhigh" => Effort::Max,
+            "xhigh" => Effort::XHigh,
+            "max" => Effort::Max,
             _ => return None,
         })
     }
@@ -396,6 +402,7 @@ impl Effort {
             Effort::Low => G::Low,
             Effort::Medium => G::Medium,
             Effort::High => G::High,
+            Effort::XHigh => G::XHigh,
             Effort::Max => G::Max,
         }
     }
@@ -1131,6 +1138,16 @@ fn stop(reason: genai::chat::StopReason) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xhigh_is_its_own_level_distinct_from_max() {
+        assert_eq!(Effort::parse("xhigh"), Some(Effort::XHigh));
+        assert_eq!(Effort::parse("max"), Some(Effort::Max));
+        assert_eq!(Effort::XHigh.label(), "xhigh");
+        // The OpenAI adapter puts the keyword on the wire (reasoning_effort).
+        assert_eq!(Effort::XHigh.genai().as_keyword(), Some("xhigh"));
+        assert_eq!(Effort::Max.genai().as_keyword(), Some("max"));
+    }
 
     #[test]
     fn images_go_out_labelled_and_numbered_across_the_conversation() {
