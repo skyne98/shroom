@@ -145,6 +145,8 @@ struct State {
 struct Child {
     state: Mutex<State>,
     inbox: Inbox,
+    /// Its calls that became background jobs, across its runs.
+    jobs: Arc<shroom_js::Jobs>,
     /// Bumped whenever the status changes; `wait` watches it.
     changed: watch::Sender<u64>,
 }
@@ -249,6 +251,7 @@ impl Agents {
                         cancel: CancellationToken::new(),
                     }),
                     inbox: Inbox::default(),
+                    jobs: Arc::default(),
                     changed: watch::channel(0).0,
                 })
             })
@@ -373,6 +376,7 @@ impl Agents {
                     cancel: CancellationToken::new(),
                 }),
                 inbox: Inbox::default(),
+                jobs: Arc::default(),
                 changed: watch::channel(0).0,
             });
             children.push(child.clone());
@@ -525,6 +529,7 @@ impl Agents {
                     agent.read_only = !info.write;
                     agent.confine = worktree.is_some();
                     agent.max_turns = Some(CHILD_TURNS);
+                    agent.jobs = child.jobs.clone();
                     agent
                 }
                 None => {
@@ -570,7 +575,9 @@ impl Agents {
                     return;
                 };
                 state.messages = messages.clone();
-                let queued = child.inbox.lock().map(|q| !q.is_empty()).unwrap_or(false);
+                // So is a note from one of its jobs (it ended meanwhile).
+                let queued = child.inbox.lock().map(|q| !q.is_empty()).unwrap_or(false)
+                    || child.jobs.has_pending();
                 queued && status != Status::Stopped
             };
             if again {
@@ -719,6 +726,21 @@ impl shroom_js::Host for Tools {
                 .filter(|title| !title.trim().is_empty())
                 .map_or_else(|| default_title(text(0)), String::from),
             _ => text(0).to_string(),
+        }
+    }
+
+    /// `agents.wait` waits by design, up to its own timeout: it is not moved
+    /// to the background after the usual few seconds. The rest are quick.
+    fn timeout(&self, name: &str, args: &[Value]) -> Option<Duration> {
+        let wait = args
+            .get(1)
+            .and_then(|opts| opts["timeout"].as_u64())
+            .map_or(WAIT, Duration::from_millis);
+        match name {
+            "agents.wait" => Some(wait + Duration::from_secs(5)),
+            // A worktree for a big checkout takes a moment.
+            "agents.spawn" | "agents.send" => Some(Duration::from_secs(60)),
+            _ => None,
         }
     }
 

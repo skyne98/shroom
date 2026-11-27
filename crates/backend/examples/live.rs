@@ -72,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("\n⟲ compacted {before} → {after} tokens · {by}")
                 }
                 Update::Steered(text) => println!("\n❯ {text}"),
+                Update::Job(text) => println!("\n◆ {text}"),
                 Update::Shown(images) => {
                     for image in images {
                         println!("  ▣ {}", image.label(0));

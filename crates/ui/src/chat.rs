@@ -261,6 +261,9 @@ enum Msg {
     Update(AgentUpdate),
     /// A subagent of some session changed or made progress.
     Agent(AgentEvent),
+    /// A background job of `doc` has a note for the model (it ended, or
+    /// waits for input).
+    JobNote(DocId),
     /// The run ended; the messages are the full conversation after it.
     Done {
         doc: DocId,
@@ -274,6 +277,30 @@ enum Msg {
 struct Worker {
     jobs: Sender<Job>,
     msgs: Receiver<Msg>,
+    /// Each conversation's background jobs, across its turns.
+    doc_jobs: DocJobs,
+}
+
+type DocJobs = Arc<std::sync::Mutex<HashMap<DocId, Arc<shroom_js::Jobs>>>>;
+
+/// `doc`'s jobs, made on first use; a note from one wakes the chat
+/// (`Msg::JobNote`), which starts a turn for it when `doc` is idle.
+fn jobs_of(jobs: &DocJobs, doc: DocId, outbox: &Sender<Msg>) -> Arc<shroom_js::Jobs> {
+    let Ok(mut jobs) = jobs.lock() else {
+        return Arc::default();
+    };
+    jobs.entry(doc)
+        .or_insert_with(|| {
+            let made = Arc::new(shroom_js::Jobs::default());
+            let outbox = std::sync::Mutex::new(outbox.clone());
+            made.notify(move || {
+                if let Ok(outbox) = outbox.lock() {
+                    let _ = outbox.send(Msg::JobNote(doc));
+                }
+            });
+            made
+        })
+        .clone()
 }
 
 impl Worker {
@@ -282,6 +309,8 @@ impl Worker {
     fn spawn(compactor: Arc<Compactor>, agents_dir: PathBuf, images: PathBuf) -> Self {
         let (jobs, inbox) = mpsc::channel::<Job>();
         let (outbox, msgs) = mpsc::channel::<Msg>();
+        let doc_jobs = DocJobs::default();
+        let shared = doc_jobs.clone();
         thread::spawn(move || {
             let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -341,6 +370,7 @@ impl Worker {
                     .context(key, window, summarizers, compactor.clone())
                     .inbox(steer)
                     .host(host, AGENT_DOCS)
+                    .jobs(jobs_of(&shared, doc, &outbox))
                     .cache_key(format!("shroom-{doc}"))
                     .images(images.clone());
                 let (result, messages) = runtime.block_on(async {
@@ -374,7 +404,11 @@ impl Worker {
                 }
             }
         });
-        Self { jobs, msgs }
+        Self {
+            jobs,
+            msgs,
+            doc_jobs,
+        }
     }
 }
 
@@ -885,6 +919,21 @@ enum Segment {
 
 fn field(text: &str) -> String {
     text.replace(['\t', '\n'], " ")
+}
+
+/// A job notification as the one-line row the user sees (the model gets
+/// the whole text).
+fn job_segment(note: &str) -> Segment {
+    let tag = |name: &str| {
+        let open = format!("<{name}>");
+        let start = note.find(&open)? + open.len();
+        let end = note[start..].find(&format!("</{name}>"))? + start;
+        Some(note[start..end].trim().to_string())
+    };
+    Segment::Note {
+        title: tag("summary").unwrap_or_else(|| "background job".into()),
+        summary: tag("status").unwrap_or_default(),
+    }
 }
 
 /// One call line of the stored body.
@@ -2177,6 +2226,7 @@ impl Chat {
             match msg {
                 Msg::Update(update) => self.apply(update),
                 Msg::Agent(event) => self.agent_event(event),
+                Msg::JobNote(doc) => self.job_note(doc),
                 Msg::Done {
                     doc,
                     result,
@@ -2272,6 +2322,7 @@ impl Chat {
             }
             AgentUpdate::Usage(usage) => self.usage = usage,
             AgentUpdate::Steered(text) => self.live.push(Segment::User(text)),
+            AgentUpdate::Job(text) => self.live.push(job_segment(&text)),
             AgentUpdate::Shown(images) => self.live.push(Segment::Images(images)),
             AgentUpdate::Compacting => self.live.push(Segment::Note {
                 title: COMPACTING.into(),
@@ -2544,6 +2595,10 @@ impl Chat {
             self.editor.insert(&late.join("\n\n"));
             self.send();
             self.editor.insert(&draft);
+        }
+        // A stop leaves the notes for the next run, which reads them first.
+        if !cancelled {
+            self.wake_jobs();
         }
     }
 
@@ -3976,6 +4031,12 @@ impl Chat {
         let Some(doc) = self.client.app().selected().map(|doc| doc.id) else {
             return;
         };
+        self.start(doc, prompt, images, resume);
+    }
+
+    /// Start a run of `doc` (the session shown, or one being woken by a
+    /// job note in the background) with `prompt` as the user's message.
+    fn start(&mut self, doc: DocId, prompt: String, images: Vec<shroom_ai::Image>, resume: bool) {
         // The exact conversation (tool calls and results included) keeps the
         // provider's prompt cache warm across restarts; the transcript text
         // is the fallback for sessions from before conversations were saved.
@@ -3994,10 +4055,10 @@ impl Chat {
         for image in &images {
             turn.push_str(&image_line(image));
         }
-        let body = self.client.app().selected().map_or(0, |doc| doc.body.len());
+        let body = self.body_len(doc);
         let mark = git::Mark::new(if resume { "" } else { &prompt }, body, messages.len());
         messages.push(shroom_ai::image::user_message(&prompt, images));
-        self.dispatch(Action::Append(turn));
+        self.append_to(doc, &turn);
         // An unnamed session takes its first prompt as its name.
         if let Some(doc) = self.client.app().selected()
             && is_default_title(&doc.title)
@@ -4006,6 +4067,23 @@ impl Chat {
             self.dispatch(Action::Rename(name));
         }
         self.failed = None;
+        if self.launch(doc, messages, mark) {
+            self.editor = Editor::default();
+            self.scroll = 0;
+        }
+    }
+
+    fn body_len(&self, doc: DocId) -> usize {
+        self.client
+            .app()
+            .docs()
+            .iter()
+            .find(|d| d.id == doc)
+            .map_or(0, |d| d.body.len())
+    }
+
+    /// Hand `messages` to the worker as a run of `doc`; false if it is gone.
+    fn launch(&mut self, doc: DocId, messages: Vec<Message>, mark: git::Mark) -> bool {
         let model = match self.entry().and_then(Entry::model) {
             Some(model) => model,
             None => fallback_model(&self.settings.model),
@@ -4027,16 +4105,90 @@ impl Chat {
         };
         if self.worker.jobs.send(job).is_err() {
             self.notice = Some("agent thread stopped · restart the app".into());
-            return;
+            return false;
         }
         self.cancel = Some(cancel);
         self.steer = Some(inbox);
         self.live_doc = Some(doc);
         self.live.clear();
         self.usage = Usage::default();
-        self.editor = Editor::default();
-        self.scroll = 0;
         self.clock.start();
+        true
+    }
+
+    /// `doc`'s background jobs, if it ever had any.
+    fn jobs(&self, doc: DocId) -> Option<Arc<shroom_js::Jobs>> {
+        self.worker.doc_jobs.lock().ok()?.get(&doc).cloned()
+    }
+
+    /// A job of `doc` has news for the model. A run of `doc` reads it
+    /// after its current step; an idle `doc` gets a turn for it (like
+    /// a message from the user, shown as a note); with another session
+    /// answering it waits for that run to end.
+    fn job_note(&mut self, doc: DocId) {
+        if self.clock.generating() {
+            return;
+        }
+        let Some(jobs) = self.jobs(doc) else {
+            return;
+        };
+        let notes = jobs.pending();
+        if notes.is_empty() {
+            return;
+        }
+        // Only sessions that ran have jobs, so the exact conversation exists.
+        let Some(mut messages) = self
+            .conversations
+            .get(&doc)
+            .cloned()
+            .or_else(|| self.load_conversation(doc))
+        else {
+            return;
+        };
+        let text = notes.join(
+            "
+
+",
+        );
+        match messages.last_mut() {
+            Some(last) if last.role == shroom_ai::Role::User => {
+                last.content.push(shroom_ai::Content::Text {
+                    text: format!(
+                        "
+
+{text}"
+                    ),
+                });
+            }
+            _ => messages.push(Message::user(text)),
+        }
+        let mark = git::Mark::new("", self.body_len(doc), messages.len());
+        self.failed = None;
+        if self.launch(doc, messages, mark) {
+            self.live = notes.iter().map(|note| job_segment(note)).collect();
+        }
+    }
+
+    /// After a run: a session whose jobs have news while it ran (or while
+    /// another session did) gets its turn now.
+    fn wake_jobs(&mut self) {
+        let waiting: Vec<DocId> = self
+            .worker
+            .doc_jobs
+            .lock()
+            .map(|jobs| {
+                jobs.iter()
+                    .filter(|(_, jobs)| jobs.has_pending())
+                    .map(|(doc, _)| *doc)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for doc in waiting {
+            if self.clock.generating() {
+                return;
+            }
+            self.job_note(doc);
+        }
     }
 
     /// Lay out one screen of `cols` × `rows` cells.

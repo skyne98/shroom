@@ -9,7 +9,7 @@ rquickjs = { version = "0.14", features = ["futures"] }
 serde_json = { workspace = true }
 # Header-only dimension probes for read() on images.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
-tokio = { version = "1", features = ["process", "time", "sync", "io-util", "rt"] }
+tokio = { version = "1", features = ["process", "time", "sync", "io-util", "rt", "macros"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

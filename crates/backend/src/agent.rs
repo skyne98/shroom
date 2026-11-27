@@ -57,7 +57,7 @@ Plain JS only: no require/import/fetch/process. Use sh for anything else.
 Make every call count. One program should do all work whose inputs you already know:
 - independent reads/searches together: await Promise.all([read(a), read(b), sh('rg -n foo src')])
 - dependent work in order with await; a thrown error stops the program
-- edit, then verify in the same program: const t = await sh('cargo test -q'); if (t.code) return t.out
+- edit, then verify in the same program: const t = await sh('cargo test -q', {timeout: 600000}); if (t.code) return t.out
 - return or console.log only what you need to see next, not whole files you won't use
 - keep commands fast: never scan whole disks or home directories (du/find over ~ or /);
   bound them (du -sh -d1 dir, find dir -maxdepth 2) and pass {timeout} for anything slow
@@ -101,6 +101,9 @@ pub enum Update {
     Compacting,
     /// A queued message (see [`Inbox`]) joined the conversation as a user turn.
     Steered(String),
+    /// A note about a background job (it ended, or waits for input) joined
+    /// the conversation as a user message.
+    Job(String),
     /// Images the programs read: the model sees them next, the user now.
     Shown(Vec<shroom_ai::Image>),
     /// The history was compacted from about `before` to `after` tokens.
@@ -135,6 +138,9 @@ pub struct Agent {
     pub max_turns: Option<usize>,
     /// Extra functions for the `js` tool (subagents).
     pub host: Option<Arc<dyn shroom_js::Host>>,
+    /// Calls that outlived their timeout, still running: one per
+    /// conversation, so later programs and turns reach them (`jobs.wait`).
+    pub jobs: Arc<shroom_js::Jobs>,
     /// `write`/`edit` refuse.
     pub read_only: bool,
     /// `write`/`edit` refuse paths outside `cwd` (its own worktree).
@@ -212,6 +218,7 @@ impl Agent {
             inbox: Inbox::default(),
             max_turns: None,
             host: None,
+            jobs: Arc::default(),
             read_only: false,
             confine: false,
             cache_key: None,
@@ -231,6 +238,12 @@ impl Agent {
         self
     }
 
+    /// Keep this conversation's background jobs in `jobs`.
+    pub fn jobs(mut self, jobs: Arc<shroom_js::Jobs>) -> Self {
+        self.jobs = jobs;
+        self
+    }
+
     /// Steer this agent through `inbox`.
     pub fn inbox(mut self, inbox: Inbox) -> Self {
         self.inbox = inbox;
@@ -245,11 +258,16 @@ impl Agent {
         self
     }
 
-    /// Queued steering messages become user turns; true if there were any.
+    /// Queued steering messages, and notes about background jobs that
+    /// ended or wait for input, become user turns; true if there were any.
     fn steer(&self, messages: &mut Vec<Message>, updates: &UnboundedSender<Update>) -> bool {
-        let queued = drain(&self.inbox);
+        let mut queued = drain(&self.inbox);
         for text in &queued {
             send(updates, Update::Steered(text.clone()));
+        }
+        for note in self.jobs.pending() {
+            send(updates, Update::Job(note.clone()));
+            queued.push(note);
         }
         if queued.is_empty() {
             return false;
@@ -648,17 +666,18 @@ impl Agent {
             },
         );
         let (log, mut calls) = tokio::sync::mpsc::unbounded_channel();
-        let forward = {
-            let updates = updates.clone();
-            async move {
-                while let Some(call) = calls.recv().await {
-                    send(&updates, Update::Call(call));
-                }
+        // Until the program ends, not until the log closes: a call that
+        // became a job keeps a sender alive for as long as the job runs.
+        let forward = async {
+            while let Some(call) = calls.recv().await {
+                send(updates, Update::Call(call));
             }
+            std::future::pending::<()>().await;
         };
         let limits = shroom_js::Limits {
             read_only: self.read_only,
             confine: self.confine,
+            jobs: self.jobs.clone(),
             ..shroom_js::Limits::default()
         };
         let run = shroom_js::run_with(&code, &self.cwd, limits, log, self.host.clone());
@@ -672,8 +691,15 @@ impl Agent {
                 });
                 return Ran::text("error: cancelled by the user while the program ran; calls that finished kept their effects");
             }
-            (outcome, ()) = async { tokio::join!(run, forward) } => outcome,
+            outcome = run => outcome,
+            () = forward => unreachable!("forward never ends"),
         };
+        // What it logged last, then no more: a job's later calls belong to
+        // no program.
+        while let Ok(call) = calls.try_recv() {
+            send(updates, Update::Call(call));
+        }
+        drop(calls);
         send(
             updates,
             Update::ProgramDone {
@@ -759,7 +785,14 @@ fn spill(text: &str, dir: &std::path::Path) -> String {
     let mut hasher = std::hash::DefaultHasher::new();
     std::hash::Hash::hash(text, &mut hasher);
     let path = dir.join(format!("{:016x}.txt", std::hash::Hasher::finish(&hasher)));
-    let saved = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, text));
+    // Tool output can hold secrets (env, keys in files): the folder is the
+    // user's alone.
+    let saved = std::fs::create_dir_all(dir)
+        .and_then(|()| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        })
+        .and_then(|()| std::fs::write(&path, text));
     let whole = match saved {
         Ok(()) => format!(
             "full output ({count} characters) in {}; read it with read()",
@@ -892,8 +925,9 @@ fn code_for(name: &str, args: &Value) -> Result<(String, Option<String>), String
                 .ok_or_else(|| need("{\"path\", \"old\", \"new\"}"))?;
             let old = text(&["old", "old_text", "old_string", "old_str", "search"])
                 .ok_or_else(|| need("{\"path\", \"old\", \"new\"}"))?;
-            let new =
-                text(&["new", "new_text", "new_string", "new_str", "replace"]).unwrap_or_default();
+            // No new text is a malformed call, not "delete it".
+            let new = text(&["new", "new_text", "new_string", "new_str", "replace"])
+                .ok_or_else(|| need("{\"path\", \"old\", \"new\"} (new may be \"\" to delete)"))?;
             let code = format!(
                 "await edit({}, {}, {}); return 'edited'",
                 quote(&path),
