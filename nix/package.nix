@@ -63,7 +63,6 @@ rustPlatform.buildRustPackage {
       "xim-ctext-0.3.0" = "sha256-pRT4Sz1JU9ros47/7pmIW9kosWOGMOItcnNd+VrvnpE=";
       "zed-font-kit-0.14.1-zed" = "sha256-KXygi0olNQi5yM8eaJVykNDtbPMDjT+cWPBF8UrtXR4=";
       "zed-scap-0.0.8-zed" = "sha256-BihiQHlal/eRsktyf0GI3aSWsUCW7WcICMsC2Xvb7kw=";
-      "gpui-base-0.5.2" = "sha256-0AY0tuhP8Jc6JXDitmXPReOvzWVnim2KY1rll9Qs2xA=";
     };
   };
 
