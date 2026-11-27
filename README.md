@@ -57,3 +57,7 @@ cargo run -p shroom-gpui      # NixOS: scripts/dev.sh cargo run -p shroom-gpui
 `scripts/dev.sh` is NixOS-only: it puts fontconfig/freetype/xkbcommon on
 `PKG_CONFIG_PATH` and `LD_LIBRARY_PATH`, which gpui needs to build and launch.
 The terminal client needs no system libs.
+
+Each launch starts a fresh session; earlier ones are in the session list
+(ctrl+s). `shroom --resume` (or `cargo run -p shroom-tui -- --resume`) opens
+the most recently used session of the current directory instead.

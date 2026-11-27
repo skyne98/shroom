@@ -52,6 +52,35 @@ impl Spring {
         damping: 1.0,
     };
 
+    // Material 3 Expressive's motion scheme (Compose `MotionScheme.expressive()`,
+    // `ExpressiveMotionTokens`). Compose springs are (stiffness, damping ratio)
+    // at mass 1, so `response = TAU / sqrt(stiffness)` (see `from_stiffness`).
+    /// Expressive fast spatial: stiffness 800, damping 0.6 (moves and shapes
+    /// of small components; overshoots about 9.5 %, by spec).
+    pub const FAST_SPATIAL: Spring = Spring {
+        response: 0.222_144_146_907_918_3,
+        damping: 0.6,
+    };
+    /// Expressive fast effects: stiffness 3800, damping 1 (colour, opacity).
+    pub const FAST_EFFECTS: Spring = Spring {
+        response: 0.101_926_724_975_859_9,
+        damping: 1.0,
+    };
+    /// Expressive default effects: stiffness 1600, damping 1 (colour, opacity,
+    /// and the shape morph of buttons, which must not bounce).
+    pub const DEFAULT_EFFECTS: Spring = Spring {
+        response: 0.157_079_632_679_489_66,
+        damping: 1.0,
+    };
+
+    /// A Compose spring (mass 1): `stiffness` in 1/s², `damping` ratio.
+    pub fn from_stiffness(stiffness: f64, damping: f64) -> Spring {
+        Spring {
+            response: std::f64::consts::TAU / stiffness.sqrt(),
+            damping,
+        }
+    }
+
     fn omega(self) -> f64 {
         std::f64::consts::TAU / self.response.max(1e-3)
     }
@@ -157,6 +186,14 @@ pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
 pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
 /// Tailwind's default transition curve: hover fades.
 pub const EASE_TAILWIND: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);
+/// Constant speed (Compose `LinearEasing`).
+pub const LINEAR: CubicBezier = CubicBezier::new(0.0, 0.0, 1.0, 1.0);
+/// Material's standard curve (Compose `FastOutSlowInEasing`).
+pub const FAST_OUT_SLOW_IN: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);
+/// Material's emphasized curve (material-web `easing-emphasized`).
+pub const EMPHASIZED: CubicBezier = CubicBezier::new(0.2, 0.0, 0.0, 1.0);
+/// Compose's outgoing elevation curve.
+pub const ELEVATION_OUT_CURVE: CubicBezier = CubicBezier::new(0.4, 0.0, 0.6, 1.0);
 
 /// A timed eased transition (zeron's `MotionSpec`): a duration and a curve.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -189,6 +226,33 @@ impl Ease {
     pub const RESIZE: Ease = Ease::new(200, EASE_OUT);
     /// Hover and highlight plates.
     pub const HOVER_FADE: Ease = Ease::new(150, EASE_TAILWIND);
+
+    // Material 3 interaction states (Compose `Ripple` and `Elevation`,
+    // material-web's focus ring). Durations and curves are the spec's.
+    /// A state layer coming or going: hover in and out, focus out.
+    pub const STATE_LAYER: Ease = Ease::new(15, LINEAR);
+    /// The focus and drag state layers coming in.
+    pub const STATE_LAYER_IN: Ease = Ease::new(45, LINEAR);
+    /// The drag state layer going.
+    pub const STATE_LAYER_DRAG_OUT: Ease = Ease::new(150, LINEAR);
+    /// Elevation rising.
+    pub const ELEVATION_IN: Ease = Ease::new(120, FAST_OUT_SLOW_IN);
+    /// Elevation falling.
+    pub const ELEVATION_OUT: Ease = Ease::new(150, ELEVATION_OUT_CURVE);
+    /// Elevation falling when the pointer leaves.
+    pub const ELEVATION_OUT_HOVER: Ease = Ease::new(120, ELEVATION_OUT_CURVE);
+    /// A press ripple fading in.
+    pub const RIPPLE_IN: Ease = Ease::new(75, LINEAR);
+    /// A press ripple growing to cover its component.
+    pub const RIPPLE_GROW: Ease = Ease::new(225, FAST_OUT_SLOW_IN);
+    /// A press ripple's centre moving to the component's.
+    pub const RIPPLE_CENTER: Ease = Ease::new(225, LINEAR);
+    /// A released ripple fading out.
+    pub const RIPPLE_OUT: Ease = Ease::new(150, LINEAR);
+    /// The focus ring growing to its active width (first quarter of 600 ms).
+    pub const FOCUS_RING_GROW: Ease = Ease::new(150, EMPHASIZED);
+    /// The focus ring settling to its width (the rest of the 600 ms).
+    pub const FOCUS_RING_SHRINK: Ease = Ease::new(450, EMPHASIZED);
 }
 
 /// An eased transition in flight: from where it started, how far along.
@@ -293,12 +357,45 @@ pub enum Key {
     Bar(usize),
     /// The window's sidebar: 0 hidden, 1 shown.
     Sidebar,
-    /// The effort slider's thumb, 0..1 along the rail.
-    Effort,
-    /// The model and effort panel: 0 closed, 1 open.
+    /// The model and effort menu: opacity 0 closed, 1 open; and its scale.
     EffortPanel,
+    EffortScale,
     /// A pointer-hover highlight (0 off, 1 on), by the client's id.
     Hover(u64),
+    /// One part of an interactive component's motion, by the client's id.
+    Control(u64, Part),
+}
+
+/// The animated parts of an interactive component (see [`Controls`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Part {
+    Hovered,
+    Focused,
+    Pressed,
+    Checked,
+    CheckedShape,
+    Elevation,
+    Outline,
+    /// The corner radii: top and bottom (see [`Shapes`]).
+    CornerTop,
+    CornerBottom,
+    RingGrow,
+    RingShrink,
+    RippleIn(u32),
+    RippleGrow(u32),
+    RippleCenter(u32),
+    RippleOut(u32),
+    /// A text field's label: 0 resting in the field, 1 floated above the
+    /// text (and shrunk to the small type).
+    Label,
+    /// A text field's focus colours (label and active indicator): 0
+    /// unfocused, 1 focused.
+    FieldFocus,
+    /// A text field's active indicator: 0 at its resting height, 1 at the
+    /// focused one.
+    Indicator,
+    /// A text field's placeholder opacity.
+    Placeholder,
 }
 
 /// Every running motion. Protocol, once per frame: [`Motions::tick`] first,
@@ -440,6 +537,22 @@ impl Motions {
         self.motions.get(key).map(|motion| motion.value)
     }
 
+    /// `key` is at its target and still (or not animated at all).
+    pub fn settled(&self, key: &Key) -> bool {
+        self.motions.get(key).is_none_or(Motion::resting)
+    }
+
+    /// Drop `key`'s motion.
+    pub fn forget(&mut self, key: &Key) {
+        self.motions.remove(key);
+    }
+
+    /// Drop every motion of component `id`.
+    pub fn forget_control(&mut self, id: u64) {
+        self.motions
+            .retain(|key, _| !matches!(key, Key::Control(of, _) if *of == id));
+    }
+
     /// Clear all per-row motions (a different transcript is shown).
     pub fn forget_rows(&mut self) {
         self.motions.retain(|key, _| !matches!(key, Key::Row(_)));
@@ -448,6 +561,531 @@ impl Motions {
     /// Something is still moving: the client should draw at full frame rate.
     pub fn active(&self) -> bool {
         self.motions.values().any(|motion| !motion.resting())
+    }
+}
+
+// ------------------------------------------------------------ components
+
+/// What happened to an interactive component (the client reports these).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ControlEvent {
+    /// The pointer entered (true) or left it.
+    Hover(bool),
+    /// A press at `at` (from its top-left corner) on a component of `size`,
+    /// both in the client's pixels. A keyboard press is at the centre.
+    Press { at: (f32, f32), size: (f32, f32) },
+    /// The press ended (released or cancelled).
+    Release,
+}
+
+/// What a component is this frame (the client knows it while drawing).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ControlSpec {
+    pub enabled: bool,
+    /// Toggled on (toggle buttons, selected items).
+    pub checked: bool,
+    /// Keyboard focus is on it (focus-visible, not a click's focus).
+    pub focused: bool,
+    /// Elevation level at rest, hovered, focused and pressed.
+    pub elevation: [f32; 4],
+    /// Outline width now, pixels (0: none).
+    pub outline: f32,
+    /// How the shape morphs (pressed, checked).
+    pub shape: Spring,
+    /// How the colours move to checked (Compose: default effects; menus:
+    /// fast effects).
+    pub colors: Spring,
+    /// Corner radii by state, morphing on `shape` (None: fixed, the client's).
+    pub shapes: Option<Shapes>,
+}
+
+/// Corner radii, px (unzoomed): the top two and the bottom two. Expressive
+/// shapes differ only between top and bottom (segmented lists, menus).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Corners {
+    pub top: f32,
+    pub bottom: f32,
+}
+
+impl Corners {
+    pub const fn all(radius: f32) -> Self {
+        Self {
+            top: radius,
+            bottom: radius,
+        }
+    }
+
+    pub const fn new(top: f32, bottom: f32) -> Self {
+        Self { top, bottom }
+    }
+}
+
+/// A component's shape in each state (Compose's `ListItemShapes`,
+/// `FilterChipDefaults.shapes`, `MenuGroupShapes`): the target is the
+/// first that applies of pressed, checked, focused, hovered, inactive, rest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shapes {
+    pub rest: Corners,
+    pub hovered: Corners,
+    pub focused: Corners,
+    pub pressed: Corners,
+    pub checked: Corners,
+    /// Once hovered and then left (Compose's menu group `inactiveShape`).
+    pub inactive: Corners,
+}
+
+impl Shapes {
+    /// The same shape in every state.
+    pub const fn fixed(corners: Corners) -> Self {
+        Self {
+            rest: corners,
+            hovered: corners,
+            focused: corners,
+            pressed: corners,
+            checked: corners,
+            inactive: corners,
+        }
+    }
+}
+
+impl Default for ControlSpec {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            checked: false,
+            focused: false,
+            elevation: [0.0; 4],
+            outline: 0.0,
+            shape: Spring::DEFAULT_EFFECTS,
+            colors: Spring::DEFAULT_EFFECTS,
+            shapes: None,
+        }
+    }
+}
+
+/// One press ripple as drawn: where it started, on what size, and how far
+/// each of its motions has come (the client turns that into a circle).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RippleLook {
+    pub at: (f32, f32),
+    pub size: (f32, f32),
+    /// Opacity, 0..1 of the pressed state layer.
+    pub alpha: f32,
+    /// 0..1 from the start radius to covering the component.
+    pub grow: f32,
+    /// 0..1 from the press point to the centre.
+    pub center: f32,
+}
+
+/// A component's animated look this frame.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ControlLook {
+    /// 0..1 each: how much of the hover and focus state layers shows.
+    pub hovered: f32,
+    pub focused: f32,
+    /// 0..1 toward the pressed shape.
+    pub pressed: f32,
+    /// 0..1 toward the checked colours, and toward the checked shape.
+    pub checked: f32,
+    pub checked_shape: f32,
+    /// Elevation level (fractional while it moves).
+    pub elevation: f32,
+    /// Outline width, pixels.
+    pub outline: f32,
+    /// Corner radii now (with `ControlSpec::shapes`), px unzoomed.
+    pub corners: Corners,
+    /// The pointer is over it (not eased: for what depends on it, such as
+    /// a menu's open groups).
+    pub over: bool,
+    /// Focus ring width in pixels while keyboard focus is on it.
+    pub ring: Option<f32>,
+    pub ripples: Vec<RippleLook>,
+}
+
+fn reduced_now(motions: &Motions) -> bool {
+    motions.reduced
+}
+
+/// The hover state layer's fade, in and out (see `Controls::look`).
+pub const HOVER_FADE: Spring = Spring::DEFAULT_EFFECTS;
+
+/// Compose's `ClosedScaleTarget`: a menu opens from, and closes to, 80 %.
+pub const MENU_CLOSED_SCALE: f64 = 0.8;
+
+/// Width of the focus ring at its peak and at rest (material-web).
+pub const RING_ACTIVE: f32 = 8.0;
+pub const RING_WIDTH: f32 = 3.0;
+
+#[derive(Clone, Copy, Debug)]
+struct Ripple {
+    slot: u32,
+    at: (f32, f32),
+    size: (f32, f32),
+    started: bool,
+    released: bool,
+    fading: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Control {
+    hovered: bool,
+    pressed: bool,
+    ring: bool,
+    /// The focus ring has started settling to its resting width.
+    ring_settling: bool,
+    /// The elevation's current target comes from hovering.
+    raised_by_hover: bool,
+    /// Hovered at least once (Compose's `hasBeenHovered`).
+    been_hovered: bool,
+    /// A text field's input phase last frame, and the spring its
+    /// placeholder fades on since the last change of phase.
+    phase: Option<Phase>,
+    placeholder: Option<Spring>,
+    ripples: Vec<Ripple>,
+    next: u32,
+}
+
+/// What a text field is this frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FieldSpec {
+    /// It holds keyboard focus (typing lands in it).
+    pub focused: bool,
+    /// It has text.
+    pub populated: bool,
+}
+
+/// A text field's animated look (Compose `TextFieldImpl`'s transition).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FieldLook {
+    /// 0..1 of the hover state layer (and the hover indicator colour).
+    pub hovered: f32,
+    /// `labelProgress`: 0 the label rests in the field, 1 it has floated.
+    /// Fast spatial: it overshoots a little, as in Compose.
+    pub label: f32,
+    /// 0..1 toward the focused label and indicator colours.
+    pub focus: f32,
+    /// 0..1 from the resting indicator height to the focused one (fast
+    /// spatial, so it can overshoot too).
+    pub indicator: f32,
+    /// The placeholder's opacity.
+    pub placeholder: f32,
+}
+
+/// Compose's `InputPhase`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Focused,
+    UnfocusedEmpty,
+    UnfocusedNotEmpty,
+}
+
+/// Material 3 interaction states of every component the client draws:
+/// state layers, the press ripple, the shape morph, elevation and the focus
+/// ring, each on the spec's curve. Protocol: `event` as input arrives,
+/// `frame` right after [`Motions::tick`], then `look` while drawing.
+#[derive(Debug, Default)]
+pub struct Controls {
+    controls: HashMap<u64, Control>,
+}
+
+impl Controls {
+    /// Component `id` is gone (a closed menu's): it starts afresh.
+    pub fn forget(&mut self, motions: &mut Motions, id: u64) {
+        self.controls.remove(&id);
+        motions.forget_control(id);
+    }
+
+    pub fn event(&mut self, id: u64, event: ControlEvent) {
+        let control = self.controls.entry(id).or_default();
+        match event {
+            ControlEvent::Hover(on) => {
+                control.hovered = on;
+                control.been_hovered |= on;
+            }
+            ControlEvent::Press { at, size } => {
+                control.pressed = true;
+                let slot = control.next;
+                control.next = control.next.wrapping_add(1);
+                control.ripples.push(Ripple {
+                    slot,
+                    at,
+                    size,
+                    started: false,
+                    released: false,
+                    fading: false,
+                });
+            }
+            ControlEvent::Release => {
+                control.pressed = false;
+                for ripple in &mut control.ripples {
+                    ripple.released = true;
+                }
+            }
+        }
+    }
+
+    /// Something waits for [`frame`](Self::frame) to start its next phase
+    /// (a fresh press, a released ripple, a focus ring done growing), so the
+    /// client must keep drawing frames even if every motion is at rest.
+    pub fn busy(&self) -> bool {
+        self.controls.values().any(|control| {
+            control.ring && !control.ring_settling
+                || control
+                    .ripples
+                    .iter()
+                    .any(|ripple| !ripple.started || ripple.released && !ripple.fading)
+        })
+    }
+
+    /// Start what input began since the last frame, and move ripples and
+    /// focus rings on to their next phase.
+    pub fn frame(&mut self, motions: &mut Motions) {
+        for (&id, control) in &mut self.controls {
+            let key = |part| Key::Control(id, part);
+            for ripple in &mut control.ripples {
+                let slot = ripple.slot;
+                if !ripple.started {
+                    ripple.started = true;
+                    motions.enter(key(Part::RippleIn(slot)), 0.0, 1.0, Ease::RIPPLE_IN);
+                    motions.enter(key(Part::RippleGrow(slot)), 0.0, 1.0, Ease::RIPPLE_GROW);
+                    motions.enter(key(Part::RippleCenter(slot)), 0.0, 1.0, Ease::RIPPLE_CENTER);
+                } else if ripple.released
+                    && !ripple.fading
+                    && [
+                        Part::RippleIn(slot),
+                        Part::RippleGrow(slot),
+                        Part::RippleCenter(slot),
+                    ]
+                    .iter()
+                    .all(|part| motions.settled(&key(*part)))
+                {
+                    // Out only once it has fully grown, however short the press.
+                    ripple.fading = true;
+                    motions.enter(key(Part::RippleOut(slot)), 1.0, 0.0, Ease::RIPPLE_OUT);
+                }
+            }
+            control.ripples.retain(|ripple| {
+                let slot = ripple.slot;
+                let gone = ripple.fading && motions.settled(&key(Part::RippleOut(slot)));
+                if gone {
+                    for part in [
+                        Part::RippleIn(slot),
+                        Part::RippleGrow(slot),
+                        Part::RippleCenter(slot),
+                        Part::RippleOut(slot),
+                    ] {
+                        motions.forget(&key(part));
+                    }
+                }
+                !gone
+            });
+            if control.ring
+                && motions.settled(&key(Part::RingGrow))
+                && motions.value(&key(Part::RingShrink)).is_none()
+            {
+                control.ring_settling = true;
+                motions.enter(key(Part::RingShrink), 0.0, 1.0, Ease::FOCUS_RING_SHRINK);
+            }
+        }
+    }
+
+    /// Text field `id`'s look now (Compose `TextFieldImpl`: `labelProgress`,
+    /// `placeholderOpacity`, `labelTextStyleColor`; `IndicatorLineNode`).
+    /// Its hover comes through [`event`](Self::event) like any component's.
+    pub fn field(&mut self, motions: &mut Motions, id: u64, spec: FieldSpec) -> FieldLook {
+        let control = self.controls.entry(id).or_default();
+        let key = |part| Key::Control(id, part);
+        let on = |b: bool| f64::from(u8::from(b));
+        let phase = match (spec.focused, spec.populated) {
+            (true, _) => Phase::Focused,
+            (false, false) => Phase::UnfocusedEmpty,
+            (false, true) => Phase::UnfocusedNotEmpty,
+        };
+        // placeholderOpacity's transitionSpec: slow effects into focus from
+        // empty, and from not-empty to empty; fast effects otherwise. The
+        // expressive slow effects spring (stiffness 800) takes about 137 ms
+        // to 90 %, past this app's 120 ms rule, so its place is taken by
+        // default effects, the next faster effects spring of the scheme.
+        if control.phase != Some(phase) {
+            let slow = matches!(
+                (control.phase, phase),
+                (Some(Phase::UnfocusedEmpty), Phase::Focused)
+                    | (Some(Phase::UnfocusedNotEmpty), Phase::UnfocusedEmpty)
+            );
+            control.placeholder = Some(if slow {
+                Spring::DEFAULT_EFFECTS
+            } else {
+                Spring::FAST_EFFECTS
+            });
+            control.phase = Some(phase);
+        }
+        let hovered = motions.follow(key(Part::Hovered), on(control.hovered), HOVER_FADE);
+        // Focused and UnfocusedNotEmpty float the label; UnfocusedEmpty
+        // rests it (showExpandedLabel).
+        let floated = phase != Phase::UnfocusedEmpty;
+        let label = motions.follow(key(Part::Label), on(floated), Spring::FAST_SPATIAL);
+        let focus = motions.follow(
+            key(Part::FieldFocus),
+            on(spec.focused),
+            Spring::FAST_EFFECTS,
+        );
+        let indicator =
+            motions.follow(key(Part::Indicator), on(spec.focused), Spring::FAST_SPATIAL);
+        let placeholder = motions.follow(
+            key(Part::Placeholder),
+            on(phase == Phase::Focused),
+            control.placeholder.unwrap_or(Spring::FAST_EFFECTS),
+        );
+        FieldLook {
+            hovered: hovered.clamp(0.0, 1.0) as f32,
+            label: label as f32,
+            focus: focus.clamp(0.0, 1.0) as f32,
+            indicator: indicator.max(0.0) as f32,
+            placeholder: placeholder.clamp(0.0, 1.0) as f32,
+        }
+    }
+
+    /// Component `id`'s look now, as `spec` says it is.
+    pub fn look(&mut self, motions: &mut Motions, id: u64, spec: ControlSpec) -> ControlLook {
+        let control = self.controls.entry(id).or_default();
+        let key = |part| Key::Control(id, part);
+        let on = |b: bool| f64::from(u8::from(b));
+        let enabled = spec.enabled;
+        let hovered = enabled && control.hovered;
+        let pressed = enabled && control.pressed;
+        let focused = enabled && spec.focused;
+
+        // The guide: "Hover states appear and disappear using a low-emphasis
+        // animated fade" (m3.material.io, Applying states). Compose's ripple
+        // tweens it over 15 ms, which reads as a cut; the motion scheme's
+        // default effects spring is the spec's animated fade.
+        let hover = motions.follow(key(Part::Hovered), on(hovered), HOVER_FADE);
+        let focus_ease = if focused {
+            Ease::STATE_LAYER_IN
+        } else {
+            Ease::STATE_LAYER
+        };
+        let focus = motions.ease(key(Part::Focused), on(focused), focus_ease);
+        let press = motions.follow(key(Part::Pressed), on(pressed), spec.shape);
+        let checked = motions.follow(key(Part::Checked), on(spec.checked), spec.colors);
+        let corners = spec.shapes.map_or_else(Corners::default, |shapes| {
+            let target = if pressed {
+                shapes.pressed
+            } else if spec.checked {
+                shapes.checked
+            } else if focused {
+                shapes.focused
+            } else if hovered {
+                shapes.hovered
+            } else if control.been_hovered {
+                shapes.inactive
+            } else {
+                shapes.rest
+            };
+            // A spring per side keeps its momentum through a reversal, as
+            // Compose's `rememberAnimatedShape`.
+            let top = motions.follow(key(Part::CornerTop), f64::from(target.top), spec.shape);
+            let bottom = motions.follow(
+                key(Part::CornerBottom),
+                f64::from(target.bottom),
+                spec.shape,
+            );
+            Corners::new(top.max(0.0) as f32, bottom.max(0.0) as f32)
+        });
+        let checked_shape = motions.follow(key(Part::CheckedShape), on(spec.checked), spec.shape);
+
+        let [rest, hover_level, focus_level, press_level] = spec.elevation;
+        let target = if !enabled {
+            0.0
+        } else if pressed {
+            press_level
+        } else if focused {
+            focus_level
+        } else if hovered {
+            hover_level
+        } else {
+            rest
+        };
+        // Compose picks the curve by direction, and by what the level is
+        // leaving: a hover's lift drops faster than a press's.
+        let now = motions
+            .value(&key(Part::Elevation))
+            .unwrap_or(f64::from(target));
+        let ease = if f64::from(target) >= now {
+            Ease::ELEVATION_IN
+        } else if control.raised_by_hover {
+            Ease::ELEVATION_OUT_HOVER
+        } else {
+            Ease::ELEVATION_OUT
+        };
+        let elevation = motions.ease(key(Part::Elevation), f64::from(target), ease);
+        control.raised_by_hover = hovered && !pressed && !focused;
+        let outline = motions.follow(
+            key(Part::Outline),
+            f64::from(spec.outline),
+            Spring::FAST_SPATIAL,
+        );
+
+        // The focus ring: grows to its active width, then settles (frame()
+        // starts the second phase once the first is done).
+        if focused && !control.ring {
+            control.ring = true;
+            control.ring_settling = reduced_now(motions);
+            motions.forget(&key(Part::RingShrink));
+            motions.enter(key(Part::RingGrow), 0.0, 1.0, Ease::FOCUS_RING_GROW);
+        } else if !focused && control.ring {
+            control.ring = false;
+            control.ring_settling = false;
+            motions.forget(&key(Part::RingGrow));
+            motions.forget(&key(Part::RingShrink));
+        }
+        let reduced = motions.reduced;
+        let ring = control.ring.then(|| {
+            if reduced {
+                return RING_WIDTH;
+            }
+            let grow = motions.value(&key(Part::RingGrow)).unwrap_or(1.0) as f32;
+            match motions.value(&key(Part::RingShrink)) {
+                Some(shrink) => RING_ACTIVE + (RING_WIDTH - RING_ACTIVE) * shrink as f32,
+                None => RING_ACTIVE * grow,
+            }
+        });
+
+        let ripples = control
+            .ripples
+            .iter()
+            .filter(|ripple| ripple.started)
+            .map(|ripple| {
+                let value = |part| motions.value(&key(part)).unwrap_or(0.0) as f32;
+                let slot = ripple.slot;
+                let alpha = if ripple.fading {
+                    value(Part::RippleOut(slot))
+                } else {
+                    value(Part::RippleIn(slot))
+                };
+                RippleLook {
+                    at: ripple.at,
+                    size: ripple.size,
+                    alpha,
+                    grow: value(Part::RippleGrow(slot)),
+                    center: value(Part::RippleCenter(slot)),
+                }
+            })
+            .collect();
+
+        ControlLook {
+            hovered: hover as f32,
+            focused: focus as f32,
+            pressed: press as f32,
+            checked: checked as f32,
+            checked_shape: checked_shape as f32,
+            elevation: elevation.max(0.0) as f32,
+            outline: outline.max(0.0) as f32,
+            corners,
+            over: control.hovered,
+            ring,
+            ripples,
+        }
     }
 }
 
@@ -623,6 +1261,50 @@ mod tests {
         }
         let (settle, overshoot, _) = run_step(Spring::COUNT);
         assert!(settle < 0.6 && overshoot <= 1e-9);
+    }
+
+    #[test]
+    fn expressive_springs_are_the_spec() {
+        // Compose's expressive scheme, (stiffness, damping) at mass 1.
+        for (spring, stiffness, damping) in [
+            (Spring::FAST_SPATIAL, 800.0, 0.6),
+            (Spring::FAST_EFFECTS, 3800.0, 1.0),
+            (Spring::DEFAULT_EFFECTS, 1600.0, 1.0),
+        ] {
+            let want = Spring::from_stiffness(stiffness, damping);
+            assert!(
+                (spring.response - want.response).abs() < 1e-12,
+                "{spring:?}"
+            );
+            assert_eq!(spring.damping, want.damping);
+        }
+        // The effects springs meet the house bounds and never overshoot.
+        for spring in [Spring::FAST_EFFECTS, Spring::DEFAULT_EFFECTS] {
+            let (settle, overshoot, ninety) = run_step(spring);
+            assert!(ninety < 0.12, "{spring:?}: 90 % after {ninety:.3}s");
+            assert!(settle < 0.3, "{spring:?}: at rest after {settle:.3}s");
+            assert!(overshoot <= 1e-9);
+        }
+        // Fast spatial is the spec's bouncy one: quick, about 9.5 % over
+        // (beyond POP's 2-9 %, on purpose: it is Material's, not ours).
+        let (settle, overshoot, ninety) = run_step(Spring::FAST_SPATIAL);
+        assert!(ninety < 0.12, "90 % after {ninety:.3}s");
+        assert!(settle < 0.4, "at rest after {settle:.3}s");
+        assert!((0.09..0.10).contains(&overshoot), "overshoot {overshoot}");
+    }
+
+    #[test]
+    fn state_eases_are_the_spec() {
+        assert_eq!(Ease::STATE_LAYER, Ease::new(15, LINEAR));
+        assert_eq!(Ease::STATE_LAYER_IN, Ease::new(45, LINEAR));
+        assert_eq!(Ease::ELEVATION_IN.ms, 120);
+        assert_eq!(Ease::ELEVATION_OUT.ms, 150);
+        assert_eq!(Ease::RIPPLE_IN.ms + Ease::RIPPLE_GROW.ms, 300);
+        assert_eq!(Ease::FOCUS_RING_GROW.ms + Ease::FOCUS_RING_SHRINK.ms, 600);
+        assert!((LINEAR.eval(0.3) - 0.3).abs() < 1e-9);
+        for ease in [Ease::STATE_LAYER, Ease::ELEVATION_IN, Ease::RIPPLE_GROW] {
+            assert!(ease.curve.eval(1.0) > 0.999 && ease.ms <= 225);
+        }
     }
 
     #[test]

@@ -153,7 +153,11 @@ fn main() -> std::io::Result<()> {
         println!("shroom {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let mut chat = Chat::open().with_startup_prompt();
+    let mut chat = Chat::open();
+    if std::env::args().any(|arg| arg == "--resume") {
+        chat = chat.resumed();
+    }
+    let mut chat = chat.with_startup_prompt();
     let mut terminal = ratatui::init();
     // Alternate scroll mode: the wheel arrives as ↑/↓ keys and mouse selection
     // keeps working (mouse capture would break copy/paste).

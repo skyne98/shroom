@@ -25,6 +25,9 @@ pub enum Face {
     Sans,
     /// A heading, level 1..=3: prose, larger.
     Title(u8),
+    /// What is typed in the prompt: prose, in the window's text field's
+    /// input type (Material 3 BodyLarge).
+    Input,
 }
 
 /// Colour and weight of one run. Colours are `0xRRGGBB`.
@@ -55,6 +58,10 @@ impl Paint {
         self.face = Face::Sans;
         self
     }
+    pub const fn input(mut self) -> Self {
+        self.face = Face::Input;
+        self
+    }
     pub const fn on(mut self, bg: u32) -> Self {
         self.bg = Some(bg);
         self
@@ -75,7 +82,8 @@ pub const ACCENT: Paint = Paint::fg(NIGHT.accent);
 pub const BAND: Paint = TEXT.on(NIGHT.surface);
 
 /// Width in cells of `text` drawn in a proportional face (`bold` or not).
-pub type Measure = std::rc::Rc<dyn Fn(&str, Face, bool) -> f32>;
+/// Width of a run of text in cells, by its paint (face, weight, slant).
+pub type Measure = std::rc::Rc<dyn Fn(&str, Paint) -> f32>;
 
 /// How a client draws prose, set once per frame ([`set_style`]).
 #[derive(Clone)]
@@ -119,9 +127,22 @@ fn pixels() -> bool {
 /// a proportional font).
 pub fn text_width(text: &str, paint: Paint) -> f32 {
     STYLE.with(|style| match (&style.borrow().measure, paint.face) {
-        (Some(measure), face) if face != Face::Mono => measure(text, face, paint.bold),
+        (Some(measure), face) if face != Face::Mono => measure(text, paint),
         _ => text.width() as f32,
     })
+}
+
+/// `text` in `room` cells drawn with `paint`: whole when it fits, else its
+/// longest prefix that does with an ellipsis.
+fn fit_ellipsis(text: &str, paint: Paint, room: f32) -> String {
+    if text_width(text, paint) <= room {
+        return text.to_string();
+    }
+    let dots = text_width("…", paint);
+    format!(
+        "{}…",
+        fit_prefix(text, paint, (room - dots).max(0.0)).trim_end()
+    )
 }
 
 /// Longest prefix of `text` that fits in `room` cells drawn with `paint`.
@@ -220,6 +241,22 @@ fn syntax(token: Token) -> u32 {
     token.color()
 }
 
+/// Ends a row that a soft wrap continues (not a newline): an empty run,
+/// never drawn, so copying can join the rows again. At a space, or inside
+/// a word (a hard split).
+const SOFT_SPACE: Paint = Paint::fg(0x0100_0001);
+const SOFT_SPLIT: Paint = Paint::fg(0x0100_0002);
+
+/// How `row` continues into the next one: `Some(" ")` at a wrapped space,
+/// `Some("")` inside a split word, None at a real line end.
+pub fn soft_break(row: &[Run]) -> Option<&'static str> {
+    match row.last() {
+        Some(last) if last.text.is_empty() && last.paint == SOFT_SPACE => Some(" "),
+        Some(last) if last.text.is_empty() && last.paint == SOFT_SPLIT => Some(""),
+        _ => None,
+    }
+}
+
 /// Word-wrap `body` to `width` cells. Row one starts with `first`, later rows
 /// with `hang` so wrapped text keeps its column. `fill` pads every row to the
 /// full width (bands behind prompts and code).
@@ -250,6 +287,8 @@ pub fn wrap(first: Row, hang: Row, body: Row, width: usize, fill: Option<Paint>)
     let mut col = row_width(&first);
     let mut row = first;
     let mut empty = true;
+    // Whether the text so far ends at a space (where a wrap breaks softly).
+    let mut at_space = false;
     for span in body {
         let paint = span.paint;
         for word in span.text.split_inclusive(' ') {
@@ -261,10 +300,14 @@ pub fn wrap(first: Row, hang: Row, body: Row, width: usize, fill: Option<Paint>)
                     col += text_width(&fits, paint);
                     row.push(run(fits, paint));
                     empty = false;
+                    at_space = rest.ends_with(' ');
                     break;
                 }
                 if !empty {
                     finish(&mut row, col, width, fill, &mut rows);
+                    if let Some(last) = rows.last_mut() {
+                        last.push(run("", if at_space { SOFT_SPACE } else { SOFT_SPLIT }));
+                    }
                     row = hang.clone();
                     col = row_width(&row);
                     empty = true;
@@ -283,6 +326,7 @@ pub fn wrap(first: Row, hang: Row, body: Row, width: usize, fill: Option<Paint>)
                 rest = &rest[piece.len()..];
                 row.push(run(piece, paint));
                 empty = false;
+                at_space = false;
             }
         }
     }
@@ -750,22 +794,23 @@ fn summary_row(lines: &[Line], work: &[(usize, usize, Role)], width: usize, mark
     }
     // The window (as Claude desktop): one quiet line, the stats after the
     // titles and a chevron after both; no columns.
+    // One row: many titles end in an ellipsis before the stats.
     if pixels() {
         let muted = Paint::fg(NIGHT.muted).sans();
-        let mut row = vec![run("  ", TEXT), run(left, muted)];
+        let mut tail = Vec::new();
         if !meta.is_empty() {
-            row.push(run(
+            tail.push(run(
                 format!(" · {}", meta.join(" · ")),
                 Paint::fg(NIGHT.faint).sans(),
             ));
         }
         if failed > 0 {
-            row.push(run(
+            tail.push(run(
                 format!(" · {failed} failed"),
                 Paint::fg(NIGHT.error).sans(),
             ));
         }
-        row.push(run(
+        tail.push(run(
             if mark.starts_with('▾') {
                 " ⌄"
             } else {
@@ -773,6 +818,14 @@ fn summary_row(lines: &[Line], work: &[(usize, usize, Role)], width: usize, mark
             },
             muted,
         ));
+        let room = width as f32 - text_width("  ", TEXT);
+        let tail_w: f32 = tail
+            .iter()
+            .map(|run| text_width(&run.text, run.paint))
+            .sum();
+        let left = fit_ellipsis(&left, muted, room - tail_w);
+        let mut row = vec![run("  ", TEXT), run(left, muted)];
+        row.extend(tail);
         return row;
     }
     let sans = |paint: Paint| paint;
@@ -912,20 +965,32 @@ fn program_rows(lines: &[Line], width: usize, live: bool) -> Vec<Row> {
         };
         if pixels() {
             // The window (as Claude desktop's steps): the title in the prose
-            // face, its stats right after it, quiet.
+            // face, its stats right after it, quiet. One row: a long title
+            // (many calls) ends in an ellipsis before the stats.
+            let stats_paint = Paint {
+                face: Face::Sans,
+                ..if paint == DIM {
+                    Paint::fg(NIGHT.muted)
+                } else {
+                    paint
+                }
+            };
+            let stats = if right.is_empty() {
+                String::new()
+            } else {
+                format!(" · {right}")
+            };
+            let room = width as f32 - text_width("  ", TEXT);
+            let stats_w = text_width(&stats, stats_paint);
+            // The stats stay unless they would leave the title almost no room.
+            let (title, stats) = if stats_w + text_width("…", TEXT.sans()) * 8. <= room {
+                (fit_ellipsis(title, TEXT.sans(), room - stats_w), stats)
+            } else {
+                (fit_ellipsis(title, TEXT.sans(), room), String::new())
+            };
             let mut row = vec![run("  ", TEXT), run(title, TEXT.sans())];
-            if !right.is_empty() {
-                row.push(run(
-                    format!(" · {right}"),
-                    Paint {
-                        face: Face::Sans,
-                        ..if paint == DIM {
-                            Paint::fg(NIGHT.muted)
-                        } else {
-                            paint
-                        }
-                    },
-                ));
+            if !stats.is_empty() {
+                row.push(run(stats, stats_paint));
             }
             rows.push(row);
         } else {
@@ -1465,8 +1530,11 @@ pub struct InputRow {
     pub cols: Vec<usize>,
 }
 
-pub const CARET: Paint = Paint::fg(NIGHT.bg).on(NIGHT.accent);
-const SELECT: Paint = TEXT.on(NIGHT.select);
+/// The prompt's caret, selected text and text (the window draws the caret
+/// as a bar and the selection in its own colours; it finds them by paint).
+pub const CARET: Paint = Paint::fg(NIGHT.bg).on(NIGHT.accent).input();
+pub const SELECT: Paint = TEXT.on(NIGHT.select).input();
+pub const INPUT: Paint = TEXT.input();
 
 /// Cells a char takes in the prompt; tabs and controls show as one space.
 fn cells(c: char) -> usize {
@@ -1475,6 +1543,12 @@ fn cells(c: char) -> usize {
     } else {
         c.width().unwrap_or(0)
     }
+}
+
+/// The caret's text: a block cell in the terminal, nothing in the window
+/// (it draws a bar there).
+fn caret_cell() -> &'static str {
+    if pixels() { "" } else { " " }
 }
 
 /// The prompt: word-wrapped rows with block caret and selection, plus the
@@ -1487,16 +1561,16 @@ pub fn input(
 ) -> (Vec<InputRow>, usize) {
     let text = editor.text();
     // Unfocused (a popup is open): no caret, no selection highlight.
-    let caret_paint = if focused { CARET.sans() } else { DIM };
+    let caret_paint = if focused { CARET } else { DIM };
     // The window's composer is a card of its own: no prompt marker there.
     let marker = if pixels() { "" } else { "> " };
     if text.is_empty() {
         // The caret sits before the placeholder, never on its first letter.
-        let row = vec![
-            run(marker, ACCENT),
-            run(" ", caret_paint),
-            run(placeholder, DIM.sans()),
-        ];
+        // The window's text field draws its own placeholder (and label).
+        let mut row = vec![run(marker, ACCENT), run(caret_cell(), caret_paint)];
+        if !pixels() {
+            row.push(run(placeholder, DIM));
+        }
         let empty = InputRow {
             row,
             start: 0,
@@ -1511,9 +1585,9 @@ pub fn input(
     // itself, see `Chat::click_text`), cells in the terminal.
     let shown = |c: char| {
         if c == '\t' || c.is_control() {
-            text_width(" ", TEXT.sans())
+            text_width(" ", INPUT)
         } else {
-            text_width(c.encode_utf8(&mut [0; 4]), TEXT.sans())
+            text_width(c.encode_utf8(&mut [0; 4]), INPUT)
         }
     };
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -1568,12 +1642,18 @@ pub fn input(
             for (i, c) in text[start..end].char_indices() {
                 let at = start + i;
                 let shown = if c == '\t' || c.is_control() { ' ' } else { c };
-                let paint = if focused && r == caret && at == cursor {
-                    CARET.sans()
+                let on_caret = focused && r == caret && at == cursor;
+                if on_caret && pixels() {
+                    // The window's caret is a bar between glyphs: a run of
+                    // its own, the glyph after it keeps its paint.
+                    row.push(run("", CARET));
+                }
+                let paint = if on_caret && !pixels() {
+                    CARET
                 } else if selected(at) {
-                    SELECT.sans()
+                    SELECT
                 } else {
-                    TEXT.sans()
+                    INPUT
                 };
                 match row.last_mut() {
                     Some(last) if last.paint == paint && last.text != "> " => last.text.push(shown),
@@ -1582,7 +1662,7 @@ pub fn input(
                 cols.extend(std::iter::repeat_n(at, cells(c)));
             }
             if focused && r == caret && cursor == end {
-                row.push(run(" ", CARET.sans()));
+                row.push(run(caret_cell(), CARET));
             } else if text[end..].starts_with('\n') && selected(end) {
                 // A selected newline shows as one highlighted cell.
                 row.push(run(" ", SELECT));
@@ -1736,7 +1816,13 @@ pub fn slice(row: &[Run], cols: Range<usize>) -> Row {
             }
             col += w;
         }
-        if !text.is_empty() {
+        // The window's caret is an empty run between glyphs: it stays when
+        // its column is inside the slice.
+        let mark = part.text.is_empty()
+            && part.paint == CARET
+            && col >= cols.start
+            && col < cols.end.max(cols.start + 1);
+        if !text.is_empty() || mark {
             out.push(run(text, part.paint));
         }
     }
@@ -1750,7 +1836,7 @@ mod tests {
     #[test]
     fn the_window_draws_a_prompt_as_a_right_aligned_bubble() {
         set_style(Style {
-            measure: Some(std::rc::Rc::new(|text: &str, _, _| {
+            measure: Some(std::rc::Rc::new(|text: &str, _| {
                 text.chars().count() as f32
             })),
             prose: 40,
@@ -1764,6 +1850,60 @@ mod tests {
         assert_eq!(cols, 34..39, "as wide as its text, one cell from the edge");
         let text: String = laid.rows[0].iter().map(|run| run.text.as_str()).collect();
         assert_eq!(text.trim(), "short");
+    }
+
+    #[test]
+    fn the_windows_step_rows_fit_the_column() {
+        set_style(Style {
+            measure: Some(std::rc::Rc::new(|text: &str, _| {
+                text.chars().count() as f32
+            })),
+            prose: 40,
+        });
+        let title = "Read a file, Run the tests, Fix the bug, Check the screenshot, Relaunch";
+        let lines = vec![
+            Line {
+                role: Role::Program,
+                text: format!("{title}\t3 calls · 1.2s"),
+            },
+            Line {
+                role: Role::Call,
+                text: "✓\tread\tsrc/main.rs\t".to_string(),
+            },
+        ];
+        let header = program_rows(&lines, 40, false).remove(0);
+        let summary = summary_row(&lines, &[(0, lines.len(), Role::Program)], 40, "▸ ");
+        set_style(Style::default());
+        for row in [&header, &summary] {
+            let text: String = row.iter().map(|run| run.text.as_str()).collect();
+            assert!(text.chars().count() <= 40, "{text:?}");
+            assert!(text.contains('…'), "{text:?}");
+            assert!(text.contains("1.2s"), "the stats stay: {text:?}");
+        }
+    }
+
+    #[test]
+    fn soft_wraps_are_marked_and_line_ends_are_not() {
+        let rows = wrap(
+            Row::new(),
+            Row::new(),
+            vec![run("alpha beta gamma delta", TEXT)],
+            12,
+            None,
+        );
+        assert!(rows.len() > 1);
+        assert_eq!(soft_break(&rows[0]), Some(" "));
+        assert_eq!(soft_break(rows.last().unwrap()), None);
+        let split = wrap(
+            Row::new(),
+            Row::new(),
+            vec![run("abcdefghijklmnop", TEXT)],
+            8,
+            None,
+        );
+        assert_eq!(soft_break(&split[0]), Some(""));
+        // The marks draw nothing and take no width.
+        assert!(rows.iter().all(|row| super::width(row) <= 12));
     }
 
     #[test]

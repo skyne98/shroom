@@ -4,6 +4,23 @@
 //! sidebar, a header, prose in a proportional font, cards behind prompts and
 //! code, a composer card with a send button, and real dialogs.
 
+#[allow(dead_code)] // the full token set; not every role is drawn yet
+mod m3;
+#[allow(dead_code)] // the full component set; not every variant is used yet
+mod m3_button;
+mod m3_chip;
+mod m3_gallery;
+mod m3_list;
+mod m3_menu;
+mod m3_nav;
+#[allow(dead_code)]
+mod m3_state;
+mod m3_text_field;
+
+use m3::{M3, shape};
+use m3_button::{Fab, IconButton, IconKind, Size};
+use m3_nav::DrawerItem;
+use m3_state::{TypeStyle, Ui};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -34,35 +51,24 @@ const ZOOM_STEP: f32 = 1.1;
 const COLUMN: usize = 84;
 /// Chrome sizes at zoom 1, in px.
 const SIDEBAR: f32 = 248.;
-const HEADER: f32 = 38.;
-const FOOTER: f32 = 28.;
-/// The composer pill (zeron): attach on the left of the text, the model and
-/// effort chip and send on its right, all 32 px tall.
-const PILL_PAD: f32 = 8.;
-const PILL_BUTTON: f32 = 32.;
-/// Space left of the reading column for the attach button.
-const PILL_LEFT: f32 = PILL_PAD + PILL_BUTTON + 6.;
-/// The effort panel (zeron's compact picker).
-const PANEL_W: f32 = 256.;
-const SLIDER_H: f32 = 36.;
-const RAIL_H: f32 = 28.;
-const THUMB_W: f32 = 44.;
-const THUMB_H: f32 = 32.;
-/// The sidebar: a shade lighter than the content, as in zeron.
-const SHELL: u32 = 0x151515;
-/// Hairlines between regions (white at ~8%).
-const LINE: u32 = 0x252525;
-/// Hovered rows and buttons (white wash at ~11%).
-const HOVER: u32 = 0x232323;
-/// The user's message bubble (white wash at ~8%).
-const BUBBLE: u32 = 0x1d1d1d;
-/// Icon glyphs (Nerd Font): sidebar, new, attach, send, stop.
-const ICON_SIDEBAR: &str = "\u{f0db}";
-const ICON_NEW: &str = "\u{f067}";
-const ICON_ATTACH: &str = "\u{f0c6}";
-const ICON_SEND: &str = "\u{f062}";
-const ICON_STOP: &str = "\u{f04d}";
-const ICON_MODEL: &str = "\u{f2db}";
+// The sidebar is a navigation drawer sheet (`NavigationDrawerTokens`).
+const _: () = assert!(SIDEBAR >= m3_nav::SHEET_WIDTH.0 && SIDEBAR <= m3_nav::SHEET_WIDTH.1);
+/// The small top app bar (`AppBarSmallTokens.ContainerHeight`).
+const HEADER: f32 = 64.;
+/// The row under the composer (model chip, notice, context ring): as tall
+/// as the chip's 48 target.
+const STATUS: f32 = m3_chip::TARGET;
+/// Between the transcript and the composer. Layout spacing, which the text
+/// field spec has no answer for: one step of the 8 dp grid (`space::S100`).
+const COMPOSER_GAP: f32 = m3::space::S100;
+/// The window behind the content pane: the navigation drawer's container.
+const SHELL: u32 = M3.surface_container;
+/// The content pane (Material 3 surface).
+const PANE: u32 = M3.surface;
+/// The user's message bubble: a tonal container.
+const BUBBLE: u32 = M3.secondary_container;
+/// Code cards sit a step below the pane.
+const CODE_CARD: u32 = M3.surface_container_lowest;
 
 struct Root {
     chat: Chat,
@@ -87,17 +93,21 @@ struct Root {
     /// Last frame's transcript rows as drawn, for mapping the pointer to a
     /// cell in proportional text.
     shown: Vec<Row>,
-    /// The effort slider's bounds last frame, and whether it is dragged.
-    slider: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
-    sliding: bool,
-    /// The model chip's text last frame (it sizes the room beside the prompt).
-    chip_label: String,
+    /// The reading column last frame (the composer's icons stand beside it).
+    column: Range<usize>,
+    /// When the last frame was laid out (the tick's stall guard).
+    rendered: std::time::Instant,
     /// Proportional glyph advances, at zoom 1 in cells, by (face, bold).
     advances: Advances,
+    /// Focus handles of the drawn Material components, by control id.
+    handles: std::collections::HashMap<u64, FocusHandle>,
+    /// Their container bounds last frame (presses ripple from the pointer).
+    places: m3_state::Places,
     _tick: Task<()>,
 }
 
-type Advances = std::rc::Rc<std::cell::RefCell<std::collections::HashMap<(Face, bool, char), f32>>>;
+type Advances =
+    std::rc::Rc<std::cell::RefCell<std::collections::HashMap<(Face, bool, bool, char), f32>>>;
 /// A screen row with its click zones.
 type ZonedRow = (Row, Vec<(Range<usize>, Cursor)>);
 
@@ -108,6 +118,10 @@ struct HitArea {
     bottom: f32,
     /// Screen rows above the composer (transcript and dock).
     above: usize,
+    /// The composer's text field's top edge, and its first text row.
+    field_top: f32,
+    /// How far the transcript is drawn below its cells (px, a scroll glide).
+    shift: f32,
     composer: (f32, f32),
     first_input: usize,
     last_input: usize,
@@ -143,6 +157,11 @@ impl Root {
 
     fn pad(&self) -> f32 {
         PAD * self.zoom
+    }
+
+    /// One input row of the composer: the text field's BodyLarge line.
+    fn input_line(&self) -> f32 {
+        m3_text_field::INPUT.line * self.zoom
     }
 
     /// Ctrl+V: images and copied files attach, text is typed.
@@ -195,29 +214,26 @@ impl Root {
     }
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        load_fonts(window);
         let text = window.text_system();
-        let _ = text.add_fonts(vec![
-            std::borrow::Cow::Borrowed(
-                include_bytes!("../fonts/ShroomSans-Regular.ttf").as_slice(),
-            ),
-            std::borrow::Cow::Borrowed(
-                include_bytes!("../fonts/ShroomSans-SemiBold.ttf").as_slice(),
-            ),
-            std::borrow::Cow::Borrowed(include_bytes!("../fonts/ShroomSans-Italic.ttf").as_slice()),
-        ]);
         let id = text.resolve_font(&font(FONT));
         let base_cell = text
             .advance(id, px(FONT_SIZE), 'm')
             .map(|size| size.width)
             .unwrap_or(px(FONT_SIZE * 0.6));
-        // Poll agent output and run motions: one display frame (16 ms) while
-        // something moves, a slow tick otherwise; idle frames cost nothing.
+        // Poll agent output: every 16 ms while something moves, a slow tick
+        // otherwise. Motion itself runs on the display's frames (`render`
+        // asks for the next one while anything moves); a timer frame lands
+        // 14 or 21 ms apart against a 60 Hz display, which reads as judder.
+        // The timer only restarts motion that lost its frame chain.
         let tick = cx.spawn(async move |this, cx| {
             let mut wait = Duration::from_millis(50);
             loop {
                 cx.background_executor().timer(wait).await;
                 let alive = this.update(cx, |root, cx| {
-                    if root.chat.poll() || root.chat.animating() {
+                    let stalled = root.chat.animating()
+                        && root.rendered.elapsed() > Duration::from_millis(50);
+                    if root.chat.poll() || stalled {
                         cx.notify();
                     }
                     root.chat.frame_interval()
@@ -228,7 +244,11 @@ impl Root {
                 }
             }
         });
-        let mut chat = Chat::open()
+        let mut chat = Chat::open();
+        if std::env::args().any(|arg| arg == "--resume") {
+            chat = chat.resumed();
+        }
+        let mut chat = chat
             .with_mouse()
             .with_pixels()
             .with_column(COLUMN)
@@ -247,11 +267,12 @@ impl Root {
             sidebar: 1.,
             generating: false,
             shown: Vec::new(),
-            slider: Default::default(),
-            sliding: false,
-            chip_label: String::new(),
+            column: 0..0,
+            rendered: std::time::Instant::now(),
             hit_area: HitArea::default(),
             advances: Default::default(),
+            handles: Default::default(),
+            places: Default::default(),
             _tick: tick,
         }
     }
@@ -262,14 +283,18 @@ impl Root {
         let text = window.text_system().clone();
         let cell = f32::from(self.base_cell);
         let cache = self.advances.clone();
-        std::rc::Rc::new(move |run: &str, face: Face, bold: bool| {
+        std::rc::Rc::new(move |run: &str, paint: Paint| {
+            let (face, bold, italic) = (paint.face, paint.bold, paint.italic);
             let mut cache = cache.borrow_mut();
             let mut total = 0.0;
             for ch in run.chars() {
-                let width = *cache.entry((face, bold, ch)).or_insert_with(|| {
+                let width = *cache.entry((face, bold, italic, ch)).or_insert_with(|| {
                     let mut f = font(SANS);
                     if bold {
                         f.weight = FontWeight::BOLD;
+                    }
+                    if italic {
+                        f.style = FontStyle::Italic;
                     }
                     let id = text.resolve_font(&f);
                     text.advance(id, px(sans_size(face)), ch)
@@ -281,9 +306,35 @@ impl Root {
         })
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let stroke = &event.keystroke;
         let modifiers = &stroke.modifiers;
+        // F6 moves keyboard focus through the window's components (Tab
+        // belongs to the composer); on a component, Tab moves on, Escape
+        // goes back to typing, Enter and Space are the component's, and
+        // anything else is typing.
+        let on_component = !self.focus.is_focused(window);
+        match stroke.key.as_str() {
+            "f6" | "tab" if on_component || stroke.key == "f6" => {
+                if modifiers.shift {
+                    window.focus_prev(cx);
+                } else {
+                    window.focus_next(cx);
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            "escape" if on_component => {
+                window.focus(&self.focus, cx);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            "enter" | "space" if on_component && !modifiers.modified() => return,
+            _ if on_component => window.focus(&self.focus, cx),
+            _ => {}
+        }
         let mods = Mods {
             ctrl: modifiers.control,
             shift: modifiers.shift,
@@ -361,12 +412,8 @@ impl Root {
                 let drawn = if part.paint.face == Face::Mono {
                     cell * span as f32
                 } else {
-                    measure(
-                        ch.encode_utf8(&mut [0; 4]),
-                        part.paint.face,
-                        part.paint.bold,
-                    ) * cell
-                        * self.zoom
+                    // `measure` counts zoom-1 cells; `cell` carries the zoom.
+                    measure(ch.encode_utf8(&mut [0; 4]), part.paint) * cell
                 };
                 if px_at + drawn / 2. > target {
                     return Some(col);
@@ -385,28 +432,20 @@ impl Root {
             return None;
         }
         let (cell, line) = (f32::from(self.cell()), self.line());
-        if y >= area.composer.1 {
-            // The card shows the row from the column's start; the chat counts
+        if y >= area.field_top {
+            // The field shows the row from the column's start; the chat counts
             // cells from window column 0.
             let col = ((x - area.composer.0) / cell).max(0.) as usize + area.column_start;
-            let row = area.first_input + ((y - area.composer.1) / line).max(0.) as usize;
+            let row =
+                area.first_input + ((y - area.composer.1) / self.input_line()).max(0.) as usize;
+            let row = row.min(area.last_input);
             return Some((row, col));
         }
         let col = ((x - self.origin.0) / cell).max(0.) as usize;
+        // Mid-glide the rows are drawn `shift` px down from their cells.
+        let y = y - area.shift;
         let row = (((y - self.origin.1) / line).max(0.) as usize).min(area.above.saturating_sub(1));
         Some((row, col))
-    }
-
-    /// Pick the effort level under `x` on the slider.
-    fn slide_to(&mut self, x: Pixels, levels: usize) {
-        let Some(bounds) = self.slider.get() else {
-            return;
-        };
-        let inset = THUMB_W / 2. * self.zoom;
-        let run = (f32::from(bounds.size.width) - 2. * inset).max(1.);
-        let at = ((f32::from(x - bounds.origin.x) - inset) / run).clamp(0., 1.);
-        self.chat
-            .set_effort_at((at * levels.saturating_sub(1) as f32).round() as usize);
     }
 
     fn on_click(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -446,12 +485,6 @@ impl Root {
         if event.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        if self.sliding {
-            let levels = self.chat.effort_level_count();
-            self.slide_to(event.position.x, levels);
-            cx.notify();
-            return;
-        }
         let changed = match self.text_at(event.position.x, event.position.y, window) {
             Some((row, at)) => self.chat.drag_text(row, at),
             None => match self.cell_at(event.position.x, event.position.y) {
@@ -477,19 +510,21 @@ impl Root {
     fn text_at(&self, x: Pixels, y: Pixels, window: &Window) -> Option<(usize, usize)> {
         let (x, y) = (f32::from(x), f32::from(y));
         let area = self.hit_area;
-        if y < area.composer.1 || y > area.bottom || x < area.left {
+        // Anywhere in the text field (its label's band too) places the caret.
+        if y < area.field_top || y > area.bottom || x < area.left {
             return None;
         }
-        let row = area.first_input + ((y - area.composer.1) / self.line()).max(0.) as usize;
+        let row = area.first_input + ((y - area.composer.1) / self.input_line()).max(0.) as usize;
         let row = row.min(area.last_input);
         let (start, end) = self.chat.input_span(row)?;
         let text = &self.chat.input_text()[start..end];
         let measure = self.measure(window);
         let cell = f32::from(self.cell());
-        // The window's prompt rows have no marker: text starts at the edge.
+        // The window's prompt rows have no marker: text starts at the
+        // field's text inset.
         let mut left = area.composer.0;
         for (at, ch) in text.char_indices() {
-            let width = measure(ch.encode_utf8(&mut [0; 4]), Face::Sans, false) * cell;
+            let width = measure(ch.encode_utf8(&mut [0; 4]), layout::INPUT) * cell;
             if x < left + width / 2. {
                 return Some((row, at));
             }
@@ -501,10 +536,6 @@ impl Root {
     /// Selecting text puts it on the primary selection (middle-click paste),
     /// like every Linux app.
     fn on_release(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if std::mem::take(&mut self.sliding) {
-            cx.notify();
-            return;
-        }
         if let Some(text) = self.chat.release() {
             cx.write_to_primary(ClipboardItem::new_string(text));
         }
@@ -535,6 +566,8 @@ impl Root {
 struct Metrics {
     cell: Pixels,
     line: f32,
+    /// The composer's input row (BodyLarge line).
+    input: f32,
     pad: f32,
     zoom: f32,
 }
@@ -597,32 +630,20 @@ fn row(cells: Row, zones: &[(Range<usize>, Cursor)], m: Metrics) -> impl IntoEle
     }))
 }
 
-/// A prompt row: its runs as text, with the caret run drawn as a thin bar
-/// in front of the character it sits on (a native text field's caret).
-fn composer_row(cells: Row, m: Metrics) -> gpui::AnyElement {
-    let caret = layout::CARET.sans();
-    let at = cells.iter().position(|run| run.paint == caret);
-    let line = div()
-        .h(px(m.line))
-        .whitespace_nowrap()
-        .flex()
-        .items_center()
-        .cursor_text();
-    let Some(at) = at else {
-        return line.children(sized(cells, m)).into_any_element();
-    };
-    let (before, after) = cells.split_at(at);
-    line.children(sized(before.to_vec(), m))
-        .child(
-            div()
-                .flex_none()
-                .w(px(2.))
-                .h(px(m.line * 0.8))
-                .rounded_full()
-                .bg(color(NIGHT.accent)),
-        )
-        .children(sized(after.to_vec(), m))
-        .into_any_element()
+/// A prompt row as the text field's input: typed text, the selection and
+/// the caret (an empty run).
+fn composer_row(cells: Row, focused: bool, ui: &Ui) -> gpui::AnyElement {
+    use m3_text_field::Span;
+    let spans = cells
+        .into_iter()
+        .filter_map(|run| match run.paint {
+            paint if paint == layout::CARET => Some(Span::Caret),
+            _ if run.text.is_empty() => None,
+            paint if paint == layout::SELECT => Some(Span::Selected(run.text.into())),
+            _ => Some(Span::Text(run.text.into())),
+        })
+        .collect();
+    m3_text_field::input_row(spans, focused, ui)
 }
 
 /// A row's runs grouped by text size (headings are larger), each group one
@@ -678,20 +699,17 @@ fn sans_size(face: Face) -> f32 {
         Face::Title(1) => 19.,
         Face::Title(2) => 16.,
         Face::Title(_) => 15.,
+        Face::Input => m3_text_field::INPUT.size,
         _ => SANS_SIZE,
     }
 }
 
 fn text_run(text: &str, paint: Paint) -> TextRun {
     // Cards draw prompt and code backgrounds; the cells keep only marks
-    // that are not panel fill (selection, inline highlights). The caret is
-    // drawn as a bar by `caret_bar`, not as a filled glyph.
-    let caret = paint == layout::CARET.sans();
-    let background = paint
-        .bg
-        .filter(|bg| *bg != NIGHT.surface && !caret)
-        .map(color);
-    let paint = if caret { layout::TEXT.sans() } else { paint };
+    // that are not panel fill (selection, inline highlights). Typed text is
+    // the text field's (`m3_text_field::input_row`).
+    let background = paint.bg.filter(|bg| *bg != NIGHT.surface).map(color);
+    let fg = color(paint.fg);
     TextRun {
         len: text.len(),
         font: Font {
@@ -707,16 +725,16 @@ fn text_run(text: &str, paint: Paint) -> TextRun {
             },
             ..font(if paint.face == Face::Mono { FONT } else { SANS })
         },
-        color: color(paint.fg),
+        color: fg,
         background_color: background,
         underline: paint.underline.then(|| UnderlineStyle {
             thickness: px(1.),
-            color: Some(color(paint.fg)),
+            color: Some(fg),
             wavy: false,
         }),
         strikethrough: paint.strike.then(|| StrikethroughStyle {
             thickness: px(1.),
-            color: Some(color(paint.fg)),
+            color: Some(fg),
         }),
     }
 }
@@ -732,7 +750,7 @@ fn picture(shown: &shroom_ui::chat::Shown, shift: Pixels, m: Metrics) -> impl In
         .top(top)
         .w(m.cell * p.cols as f32)
         .h(px(p.rows as f32 * m.line))
-        .bg(color(NIGHT.bg))
+        .bg(color(PANE))
         .overflow_hidden()
         .opacity(shown.fade)
         .child(img(p.png.clone()).size_full().object_fit(ObjectFit::Fill))
@@ -759,8 +777,8 @@ fn scrollbar_at(
     let inset = px(2.);
     // 3 px collapsed, 6 px open; the track fades in with it.
     let width = 3. + 3. * open;
-    let track = shroom_ui::motion::mix(NIGHT.bg, NIGHT.surface, f64::from(open));
-    let thumb = shroom_ui::motion::mix(NIGHT.faint, NIGHT.dim, f64::from(open));
+    let track = shroom_ui::motion::mix(PANE, M3.surface_container_high, f64::from(open));
+    let thumb = shroom_ui::motion::mix(M3.outline_variant, M3.outline, f64::from(open));
     let id = bar.id;
     div()
         .id(("scrollbar", id))
@@ -801,13 +819,22 @@ fn scrollbar_at(
 /// field, then the items as rows with proportional names and flush-right
 /// hints. Clicks inside never reach the chat; a click on the dimmed backdrop
 /// closes it (the chat does that for clicks outside).
-fn popup(view: Popup, hints: Vec<String>, m: Metrics, cx: &mut Context<Root>) -> impl IntoElement {
+fn popup(
+    view: Popup,
+    hints: Vec<String>,
+    m: Metrics,
+    ui: &Ui,
+    cx: &mut Context<Root>,
+) -> impl IntoElement {
     let open = view.open.clamp(0.0, 1.0) as f32;
     let grow = (0.96 + 0.04 * view.open) as f32;
-    let row_h = (m.line * 1.5).round();
+    let row_h = m3_list::HEIGHT[0] * m.zoom;
     let width = (f32::from(m.cell) * view.width as f32 + 32. * m.zoom).max(360. * m.zoom) * grow;
     let (window, shift) = (view.window, view.shift);
     let selected = view.selected;
+    let root = cx.entity();
+    // The rows: one-line list items (selected = the highlighted one), the
+    // name as headline and the hint as trailing supporting text.
     let rows: Vec<_> = view
         .labels
         .into_iter()
@@ -816,111 +843,67 @@ fn popup(view: Popup, hints: Vec<String>, m: Metrics, cx: &mut Context<Root>) ->
         .skip(1)
         .map(|(n, (label, item))| {
             let (name, hint) = label.unwrap_or_default();
-            let chosen = selected == Some(n);
-            let line = div()
-                .id(("dialog-row", n))
-                .role(gpui::Role::ListBoxOption)
-                .aria_label(SharedString::from(format!("{name} {hint}")))
-                .aria_selected(chosen)
+            let row = m3_list::ListItem::new(format!("dialog-row-{n}"), name)
+                .container(M3.surface_container_high)
+                .selected(selected == Some(n));
+            let row = if hint.is_empty() {
+                row
+            } else {
+                row.trailing(hint)
+            };
+            let row = match item {
+                Some(index) => {
+                    let root = root.clone();
+                    row.on_click(move |_, cx| {
+                        root.update(cx, |root, cx| {
+                            let outcome = root.chat.pick(index);
+                            root.apply(outcome, cx);
+                            cx.notify();
+                        })
+                    })
+                }
+                None => row.enabled(false),
+            };
+            div()
                 .h(px(row_h))
-                .ml(px(6. * m.zoom))
-                .mr(px(12. * m.zoom))
-                .px(px(10. * m.zoom))
-                .rounded(px(6. * m.zoom))
-                .flex()
-                .items_center()
-                .gap(px(12. * m.zoom))
-                .when(chosen, |row| row.bg(color(NIGHT.select)))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .font_family(SANS)
-                        .text_size(px(SANS_SIZE * m.zoom))
-                        .text_color(color(NIGHT.text))
-                        .when(chosen, |name| name.font_weight(FontWeight::BOLD))
-                        .child(SharedString::from(name)),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .whitespace_nowrap()
-                        .font_family(FONT)
-                        .text_size(px(11.5 * m.zoom))
-                        .text_color(color(if chosen { NIGHT.text } else { NIGHT.muted }))
-                        .child(SharedString::from(hint)),
-                );
-            match item {
-                Some(index) => line
-                    .cursor_pointer()
-                    .when(!chosen, |row| row.hover(|style| style.bg(color(HOVER))))
-                    .on_click(cx.listener(move |root, _, _, cx| {
-                        let outcome = root.chat.pick(index);
-                        root.apply(outcome, cx);
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-                None => line.into_any_element(),
-            }
+                .child(row.render(ui, cx))
+                .into_any_element()
         })
         .collect();
+    // The search field: a filled text field (the same component as the
+    // composer), its text and caret drawn by `input_row`.
     let field = view.field.map(|(text, placeholder)| {
-        let empty = text.is_empty();
-        div()
-            .id("dialog-field")
-            .role(gpui::Role::TextInput)
-            .aria_label(SharedString::from(view.title.clone()))
-            .aria_placeholder(SharedString::from(placeholder.clone()))
-            .mx(px(12. * m.zoom))
-            .mb(px(8. * m.zoom))
-            .h(px(row_h + 4. * m.zoom))
-            .px(px(10. * m.zoom))
-            .rounded(px(7. * m.zoom))
-            .bg(color(NIGHT.bg))
-            .border_1()
-            .border_color(color(NIGHT.accent))
-            .flex()
-            .items_center()
-            .font_family(SANS)
-            .text_size(px(SANS_SIZE * m.zoom))
-            .when(empty, |field| {
-                field.child(
-                    div()
-                        .w(px(2.))
-                        .h(px(m.line * 0.9))
-                        .mr(px(1.))
-                        .bg(color(NIGHT.accent)),
-                )
-            })
-            .child(
-                div()
-                    .text_color(color(if empty { NIGHT.dim } else { NIGHT.text }))
-                    .child(SharedString::from(if empty { placeholder } else { text })),
-            )
-            .when(!empty, |field| {
-                field.child(
-                    div()
-                        .w(px(2.))
-                        .h(px(m.line * 0.9))
-                        .ml(px(1.))
-                        .bg(color(NIGHT.accent)),
-                )
-            })
+        let populated = !text.is_empty();
+        let mut spans = Vec::new();
+        if populated {
+            spans.push(m3_text_field::Span::Text(text.into()));
+        }
+        spans.push(m3_text_field::Span::Caret);
+        m3_text_field::TextField::new("dialog-field", "Search")
+            .placeholder(placeholder)
+            .leading(m3_state::icon_glyph(
+                m3::icon::SEARCH,
+                m3_text_field::ICON,
+                false,
+                m3_text_field::colors(&M3).icon,
+                m.zoom,
+            ))
+            .rows(vec![m3_text_field::input_row(spans, true, ui)])
+            .focused(true)
+            .populated(populated)
+            .render(ui)
+            .mx(px(m3::space::S300 * m.zoom))
+            .mb(px(m3::space::S100 * m.zoom))
     });
     let header = view.header.map(|header| {
         div()
-            .ml(px(16. * m.zoom))
-            .mr(px(22. * m.zoom))
-            .mb(px(2. * m.zoom))
+            .px(px((8. + m3_list::PADDING.1) * m.zoom))
+            .mb(px(m3::space::S50 * m.zoom))
             .flex()
             .justify_end()
-            .whitespace_nowrap()
-            .font_family(FONT)
-            .text_size(px(11.5 * m.zoom))
-            .text_color(color(NIGHT.dim))
+            .one_line()
+            .type_style(m3_list::TRAILING, m.zoom)
+            .text_color(color(M3.on_surface_variant))
             .child(SharedString::from(header))
     });
     let has_rows = !rows.is_empty();
@@ -933,6 +916,7 @@ fn popup(view: Popup, hints: Vec<String>, m: Metrics, cx: &mut Context<Root>) ->
             div()
                 .flex()
                 .flex_col()
+                .px(px(8. * m.zoom))
                 .mt(px(-shift * row_h))
                 .children(rows),
         );
@@ -946,7 +930,7 @@ fn popup(view: Popup, hints: Vec<String>, m: Metrics, cx: &mut Context<Root>) ->
             .w(px(4. * m.zoom))
             .h(px(len))
             .rounded_full()
-            .bg(color(NIGHT.faint))
+            .bg(color(M3.outline_variant))
     });
     div()
         .absolute()
@@ -962,7 +946,7 @@ fn popup(view: Popup, hints: Vec<String>, m: Metrics, cx: &mut Context<Root>) ->
                 |_, _, _| (),
                 move |bounds, (), window, _| {
                     window.paint_backdrop_blur(bounds, gpui::Corners::all(px(0.)), px(5. * m.zoom));
-                    window.paint_quad(gpui::fill(bounds, hsla(0., 0., 0., 0.28 * open)));
+                    window.paint_quad(gpui::fill(bounds, hsla(0., 0., 0., m3::SCRIM * open)));
                 },
             )
             .absolute()
@@ -979,23 +963,20 @@ fn popup(view: Popup, hints: Vec<String>, m: Metrics, cx: &mut Context<Root>) ->
                 .on_scroll_wheel(cx.listener(Root::on_scroll))
                 .w(px(width))
                 .opacity(open)
-                .bg(color(NIGHT.surface))
-                .border_1()
-                .border_color(color(LINE))
-                .rounded(px(12. * m.zoom))
-                .shadow_lg()
-                .py(px(8. * m.zoom))
+                .bg(color(M3.surface_container_high))
+                .rounded(px(shape::EXTRA_LARGE * m.zoom))
+                .shadow(m3_state::shadows(3., m.zoom, M3.shadow))
+                .overflow_hidden()
+                .py(px(12. * m.zoom))
                 .flex()
                 .flex_col()
                 .child(
                     div()
-                        .px(px(16. * m.zoom))
-                        .pt(px(4. * m.zoom))
-                        .pb(px(10. * m.zoom))
-                        .font_family(SANS)
-                        .text_size(px(12.5 * m.zoom))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(color(NIGHT.dim))
+                        .px(px(24. * m.zoom))
+                        .pt(px(8. * m.zoom))
+                        .pb(px(12. * m.zoom))
+                        .type_style(m3::font::TITLE_LARGE, m.zoom)
+                        .text_color(color(M3.on_surface))
                         .child(SharedString::from(view.title)),
                 )
                 .children(field)
@@ -1007,19 +988,16 @@ fn popup(view: Popup, hints: Vec<String>, m: Metrics, cx: &mut Context<Root>) ->
                 .when(has_rows && !hints.is_empty(), |card| {
                     card.child(
                         div()
-                            .mt(px(6. * m.zoom))
-                            .mb(px(-8. * m.zoom))
-                            .px(px(16. * m.zoom))
-                            .h(px(30. * m.zoom))
-                            .rounded_b(px(12. * m.zoom))
-                            .bg(hsla(0., 0., 0., 0.16))
-                            .border_t_1()
-                            .border_color(color(LINE))
+                            .mt(px(8. * m.zoom))
+                            .mb(px(-12. * m.zoom))
+                            .px(px(24. * m.zoom))
+                            .h(px(36. * m.zoom))
+                            .bg(color(M3.surface_container))
                             .flex()
                             .items_center()
-                            .gap(px(12. * m.zoom))
-                            .text_size(px(11.5 * m.zoom))
-                            .text_color(color(NIGHT.muted))
+                            .gap(px(16. * m.zoom))
+                            .type_style(m3::font::LABEL_MEDIUM, m.zoom)
+                            .text_color(color(M3.on_surface_variant))
                             .children(hints.into_iter().map(SharedString::from)),
                     )
                 }),
@@ -1028,7 +1006,13 @@ fn popup(view: Popup, hints: Vec<String>, m: Metrics, cx: &mut Context<Root>) ->
 
 /// The left sidebar: product mark, new-session button, the sessions with
 /// their state, and the working folder at the bottom.
-fn sidebar(chrome: &Chrome, m: Metrics, width: f32, cx: &mut Context<Root>) -> gpui::AnyElement {
+fn sidebar(
+    chrome: &Chrome,
+    m: Metrics,
+    width: f32,
+    ui: &Ui,
+    cx: &mut Context<Root>,
+) -> gpui::AnyElement {
     let z = m.zoom;
     let mark = img(gpui::ImageSource::Image(std::sync::Arc::new(
         gpui::Image::from_bytes(
@@ -1036,57 +1020,31 @@ fn sidebar(chrome: &Chrome, m: Metrics, width: f32, cx: &mut Context<Root>) -> g
             include_bytes!("../../../nix/icons/shroom-64.png").to_vec(),
         ),
     )))
-    .size(px(22. * z))
-    .rounded(px(5. * z));
-    let new = div()
-        .id("new-session")
-        .role(gpui::Role::Button)
-        .aria_label("New session")
-        .aria_keyshortcuts("Control+N")
-        .mx(px(8. * z))
-        .h(px(30. * z))
-        .px(px(8. * z))
-        .rounded(px(7. * z))
-        .flex()
-        .items_center()
-        .gap(px(8. * z))
-        .text_color(color(NIGHT.text))
-        .cursor_pointer()
-        .hover(|style| style.bg(color(HOVER)))
-        .on_click(cx.listener(|root, _, _, cx| {
-            let outcome = root.chat.press("ctrl+n new");
-            root.apply(outcome, cx);
-            cx.notify();
-        }))
-        .child(
-            div()
-                .w(px(16. * z))
-                .font_family(FONT)
-                .text_size(px(12. * z))
-                .text_color(color(NIGHT.muted))
-                .child(ICON_NEW),
-        )
-        .child(div().flex_1().child("New session"))
-        .child(
-            div()
-                .font_family(FONT)
-                .text_size(px(11. * z))
-                .text_color(color(NIGHT.faint))
-                .child("ctrl+n"),
-        );
+    .size(px(26. * z))
+    .rounded(px(shape::SMALL * z));
+    // The drawer's primary action: an extended FAB, lowered on its surface.
+    let new = div().px(px(12. * z)).pt(px(4. * z)).pb(px(8. * z)).child(
+        Fab::new("new-session", m3::icon::EDIT_SQUARE, "New session")
+            .extended("New session")
+            .lowered()
+            .keyshortcuts("Control+N")
+            .on_click(press_hint("ctrl+n new", cx))
+            .render(ui, cx),
+    );
+    // The sessions: navigation drawer items (the state as the icon, the
+    // age as the badge).
     let sessions: Vec<_> = chrome
         .sessions
         .iter()
-        .enumerate()
-        .map(|(n, session)| {
+        .map(|session| {
             let id = session.id;
-            let state_colour = match session.state.as_str() {
-                "answering" => NIGHT.accent,
-                "stopped" => NIGHT.error,
-                "" => 0x3a3a3a,
-                _ => NIGHT.agent,
+            let icon = match session.state.as_str() {
+                "answering" => m3::icon::BOLT,
+                "stopped" => m3::icon::STOP,
+                "" => m3::icon::CHAT_BUBBLE,
+                _ => m3::icon::SMART_TOY,
             };
-            // `4 turns · 2h ago`: the age goes on the right, like a mail list.
+            // `4 turns · 2h ago`: the age is the badge.
             let age = session
                 .detail
                 .rsplit(" · ")
@@ -1094,80 +1052,26 @@ fn sidebar(chrome: &Chrome, m: Metrics, width: f32, cx: &mut Context<Root>) -> g
                 .unwrap_or_default()
                 .trim_end_matches(" ago")
                 .to_string();
-            let label = if session.state.is_empty() {
+            let aria = if session.state.is_empty() {
                 format!("{}, {}", session.title, session.detail)
             } else {
                 format!("{}, {}, {}", session.title, session.state, session.detail)
             };
-            div()
-                .id(("session", n))
-                .role(gpui::Role::ListItem)
-                .aria_label(SharedString::from(label))
-                .aria_selected(session.current)
-                .mx(px(8. * z))
-                .h(px(30. * z))
-                .px(px(8. * z))
-                .rounded(px(7. * z))
-                .flex()
-                .items_center()
-                .gap(px(8. * z))
-                .cursor_pointer()
-                .when(session.current, |row| {
-                    row.bg(color(HOVER)).border_1().border_color(color(LINE))
+            let root = cx.entity();
+            DrawerItem::new(format!("session-{id}"), session.title.clone())
+                .selected(session.current)
+                .icon(icon)
+                .badge(age)
+                .aria(aria)
+                .on_click(move |_, cx| {
+                    root.update(cx, |root, cx| {
+                        root.chat.open_session(id);
+                        cx.notify();
+                    })
                 })
-                .when(!session.current, |row| {
-                    row.hover(|style| style.bg(color(0x1c1c1c)))
-                })
-                .on_click(cx.listener(move |root, _, _, cx| {
-                    root.chat.open_session(id);
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(16. * z))
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .size(px(6. * z))
-                                .rounded_full()
-                                .bg(color(state_colour)),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_color(color(if session.current {
-                            NIGHT.text
-                        } else {
-                            NIGHT.dim
-                        }))
-                        .child(SharedString::from(session.title.clone())),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(11.5 * z))
-                        .text_color(color(NIGHT.muted))
-                        .child(SharedString::from(age)),
-                )
-                .into_any_element()
+                .render(ui, cx)
         })
         .collect();
-    let section = |label: &'static str| {
-        div()
-            .px(px(16. * z))
-            .pt(px(14. * z))
-            .pb(px(6. * z))
-            .text_size(px(11.5 * z))
-            .text_color(color(NIGHT.muted))
-            .child(label)
-    };
     div()
         .id("sidebar")
         .role(gpui::Role::Navigation)
@@ -1177,8 +1081,6 @@ fn sidebar(chrome: &Chrome, m: Metrics, width: f32, cx: &mut Context<Root>) -> g
         .h_full()
         .overflow_hidden()
         .bg(color(SHELL))
-        .border_r_1()
-        .border_color(color(LINE))
         .flex()
         .flex_col()
         .font_family(SANS)
@@ -1186,75 +1088,34 @@ fn sidebar(chrome: &Chrome, m: Metrics, width: f32, cx: &mut Context<Root>) -> g
         .child(
             div()
                 .h(px(HEADER * z))
-                .px(px(14. * z))
+                .px(px(20. * z))
+                .pt(px(4. * z))
                 .flex()
                 .items_center()
-                .gap(px(8. * z))
+                .gap(px(10. * z))
                 .child(mark)
                 .child(
                     div()
+                        .type_style(m3::font::TITLE_MEDIUM, z)
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_size(px(13.5 * z))
-                        .text_color(color(NIGHT.text))
+                        .text_color(color(M3.on_surface))
                         .child("shroom"),
                 ),
         )
         .child(new)
-        .child(section("Sessions"))
+        .child(m3_nav::headline("Sessions", ui))
         .child(
             div()
                 .id("session-list")
+                .role(gpui::Role::TabList)
+                .aria_label("Sessions")
                 .flex_1()
                 .overflow_y_scroll()
+                .pb(px(12. * z))
                 .flex()
                 .flex_col()
-                .gap(px(1. * z))
+                .gap(px(m3_nav::ITEM_SPACE * z))
                 .children(sessions),
-        )
-        .child(
-            div()
-                .mx(px(8. * z))
-                .mb(px(8. * z))
-                .h(px(32. * z))
-                .px(px(8. * z))
-                .rounded(px(7. * z))
-                .flex()
-                .items_center()
-                .gap(px(8. * z))
-                .text_size(px(12. * z))
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(18. * z))
-                        .rounded_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .font_family(FONT)
-                        .text_size(px(12. * z))
-                        .text_color(color(NIGHT.muted))
-                        .child("\u{f07b}"),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_color(color(NIGHT.dim))
-                        .child(SharedString::from(chrome.folder.clone())),
-                )
-                .when_some(chrome.branch.clone(), |row, branch| {
-                    row.child(
-                        div()
-                            .flex_none()
-                            .font_family(FONT)
-                            .text_size(px(11. * z))
-                            .text_color(color(NIGHT.muted))
-                            .child(SharedString::from(format!("\u{e725} {branch}"))),
-                    )
-                }),
         )
         .into_any_element()
 }
@@ -1262,103 +1123,100 @@ fn sidebar(chrome: &Chrome, m: Metrics, width: f32, cx: &mut Context<Root>) -> g
 /// The title bar: sidebar toggle, the session's name and folder, new
 /// session. Quiet, no rule under it; the model and context live by the
 /// composer.
-fn header(chrome: &Chrome, m: Metrics, cx: &mut Context<Root>) -> gpui::AnyElement {
-    let z = m.zoom;
+/// The small top app bar (`AppBarSmallTokens`, `AppBarTokens`): the
+/// navigation icon, the title over its subtitle, one action.
+fn header(chrome: &Chrome, ui: &Ui, cx: &mut Context<Root>) -> gpui::AnyElement {
+    let z = ui.zoom;
+    let title = m3::font::TITLE_LARGE;
+    let subtitle = m3::font::LABEL_MEDIUM;
     div()
         .id("header")
         .role(gpui::Role::Banner)
         .flex_none()
         .h(px(HEADER * z))
-        .px(px(8. * z))
+        .pl(px(m3::space::S50 * z))
+        .pr(px(m3::space::S50 * z))
         .flex()
         .items_center()
-        .gap(px(4. * z))
+        .bg(color(M3.surface))
         .font_family(SANS)
-        .child(icon_button(
-            "toggle-sidebar",
-            ICON_SIDEBAR,
-            "Toggle sidebar",
-            "ctrl+b sidebar",
-            m,
-            cx,
-        ))
+        .child(
+            IconButton::new(
+                "toggle-sidebar",
+                IconKind::Standard,
+                m3::icon::MENU,
+                "Toggle sidebar",
+            )
+            // The navigation icon takes the bar's leading icon colour.
+            .content(M3.on_surface)
+            .keyshortcuts("Control+B")
+            .on_click(press_hint("ctrl+b sidebar", cx))
+            .render(ui, cx),
+        )
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.))
-                .ml(px(4. * z))
+                .px(px(4. * z))
                 .flex()
-                .items_baseline()
-                .gap(px(8. * z))
+                .flex_col()
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .child(
                     div()
-                        .flex_none()
-                        .text_size(px(13. * z))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(color(NIGHT.text))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_size(px(title.size * z))
+                        .line_height(px(title.line * z))
+                        .font_weight(title.weight)
+                        .text_color(color(M3.on_surface))
                         .child(SharedString::from(chrome.title.clone())),
                 )
                 .child(
                     div()
                         .overflow_hidden()
                         .text_ellipsis()
-                        .text_size(px(12. * z))
-                        .text_color(color(NIGHT.muted))
+                        .text_size(px(subtitle.size * z))
+                        .line_height(px(subtitle.line * z))
+                        .font_weight(subtitle.weight)
+                        .text_color(color(M3.on_surface_variant))
                         .child(SharedString::from(chrome.folder.clone())),
                 ),
         )
-        .child(icon_button(
-            "new-session-top",
-            ICON_NEW,
-            "New session",
-            "ctrl+n new",
-            m,
-            cx,
-        ))
+        .child(
+            IconButton::new(
+                "new-session-top",
+                IconKind::Standard,
+                m3::icon::EDIT_SQUARE,
+                "New session",
+            )
+            .keyshortcuts("Control+N")
+            .on_click(press_hint("ctrl+n new", cx))
+            .render(ui, cx),
+        )
         .into_any_element()
 }
 
-/// A square ghost button with one icon glyph that runs a key hint.
-fn icon_button(
-    id: &'static str,
-    glyph: &'static str,
-    label: &'static str,
-    keys: &'static str,
-    m: Metrics,
+/// Runs a key hint (as its key would) when clicked.
+fn press_hint(
+    hint: &'static str,
     cx: &mut Context<Root>,
-) -> impl IntoElement {
-    let z = m.zoom;
+) -> impl Fn(&mut Window, &mut App) + 'static {
     let root = cx.entity();
-    gpui_base::Button::new(id)
-        .aria_label(label)
-        .flex_none()
-        .size(px(28. * z))
-        .rounded(px(6. * z))
-        .flex()
-        .items_center()
-        .justify_center()
-        .font_family(FONT)
-        .text_size(px(14. * z))
-        .text_color(color(NIGHT.muted))
-        .cursor_pointer()
-        .hover(|style| style.bg(color(HOVER)).text_color(color(NIGHT.text)))
-        .on_click(move |_, _, cx| {
-            root.update(cx, |root, cx| {
-                let outcome = root.chat.press(keys);
-                root.apply(outcome, cx);
-                cx.notify();
-            });
-        })
-        .child(glyph)
+    move |_, cx| {
+        root.update(cx, |root, cx| {
+            let outcome = root.chat.press(hint);
+            root.apply(outcome, cx);
+            cx.notify();
+        });
+    }
 }
 
 /// The context meter under the composer: a small ring and the share used.
 fn context_meter(share: f64, m: Metrics) -> impl IntoElement {
     let z = m.zoom;
     let share = share.clamp(0.0, 1.0) as f32;
-    let tone = if share > 0.8 { NIGHT.code } else { NIGHT.muted };
+    let tone = if share > 0.8 { M3.tertiary } else { M3.primary };
     let size = 12. * z;
     div()
         .id("context")
@@ -1370,15 +1228,15 @@ fn context_meter(share: f64, m: Metrics) -> impl IntoElement {
         .flex()
         .items_center()
         .gap(px(5. * z))
-        .text_size(px(11.5 * z))
-        .text_color(color(NIGHT.muted))
+        .type_style(m3::font::LABEL_SMALL, z)
+        .text_color(color(M3.on_surface_variant))
         .child(
             canvas(
                 |_, _, _| (),
                 move |bounds, (), window, _| {
                     let centre = bounds.center();
                     let r = bounds.size.width.min(bounds.size.height) / 2. - px(1.);
-                    ring(window, centre, r, 1., color(LINE));
+                    ring(window, centre, r, 1., color(M3.surface_container_highest));
                     ring(window, centre, r, share, color(tone));
                 },
             )
@@ -1411,7 +1269,7 @@ fn ring(window: &mut Window, centre: gpui::Point<Pixels>, r: Pixels, share: f32,
 
 /// The empty session: the mark, where the agent works, the model, three
 /// example tasks as buttons, and the one key to remember.
-fn welcome(info: &Welcome, m: Metrics, cx: &mut Context<Root>) -> impl IntoElement {
+fn welcome(info: &Welcome, m: Metrics, ui: &Ui, cx: &mut Context<Root>) -> impl IntoElement {
     let z = m.zoom;
     let mark = img(gpui::ImageSource::Image(std::sync::Arc::new(
         gpui::Image::from_bytes(
@@ -1420,7 +1278,7 @@ fn welcome(info: &Welcome, m: Metrics, cx: &mut Context<Root>) -> impl IntoEleme
         ),
     )))
     .size(px(72. * z))
-    .rounded(px(16. * z));
+    .rounded(px(shape::EXTRA_LARGE * z));
     let fact = |label: &str, value: String, mono: bool| {
         div()
             .flex()
@@ -1428,42 +1286,39 @@ fn welcome(info: &Welcome, m: Metrics, cx: &mut Context<Root>) -> impl IntoEleme
             .child(
                 div()
                     .w(px(84. * z))
-                    .text_color(color(NIGHT.muted))
+                    .text_color(color(M3.on_surface_variant))
                     .child(SharedString::from(label.to_string())),
             )
             .child(
                 div()
                     .when(mono, |value| value.font_family(FONT).text_size(px(13. * z)))
-                    .text_color(color(NIGHT.text))
+                    .text_color(color(M3.on_surface))
                     .child(SharedString::from(value)),
             )
     };
+    // The suggestions: a segmented list (Compose's recommended list of
+    // choices, `SegmentedListItem` on `surfaceContainer`).
+    let count = info.starters.len();
+    let root = cx.entity();
     let starters: Vec<_> = info
         .starters
         .iter()
         .enumerate()
         .map(|(n, text)| {
-            div()
-                .id(("starter", n))
-                .role(gpui::Role::Button)
-                .aria_label(SharedString::from(text.clone()))
-                .px(px(14. * z))
-                .py(px(10. * z))
-                .rounded(px(9. * z))
-                .border_1()
-                .border_color(color(LINE))
-                .bg(color(SHELL))
-                .text_color(color(NIGHT.text))
-                .cursor_pointer()
-                .hover(|style| style.bg(color(HOVER)).border_color(color(NIGHT.faint)))
-                .on_click(cx.listener(move |root, _, _, cx| {
-                    root.chat.use_starter(n);
-                    cx.notify();
-                }))
-                .child(SharedString::from(text.clone()))
-                .into_any_element()
+            let root = root.clone();
+            m3_list::ListItem::new(format!("starter-{n}"), text.clone())
+                .segmented(n, count)
+                .container(M3.surface_container)
+                .on_click(move |_, cx| {
+                    root.update(cx, |root, cx| {
+                        root.chat.use_starter(n);
+                        cx.notify();
+                    })
+                })
+                .render(ui, cx)
         })
         .collect();
+    let starters = m3_list::segmented_list("Suggestions", starters, ui);
     div()
         .absolute()
         .inset_0()
@@ -1493,14 +1348,14 @@ fn welcome(info: &Welcome, m: Metrics, cx: &mut Context<Root>) -> impl IntoEleme
                                 .flex_col()
                                 .child(
                                     div()
-                                        .text_size(px(22. * z))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(color(NIGHT.text))
+                                        .type_style(m3::font::HEADLINE_MEDIUM, z)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(color(M3.on_surface))
                                         .child("What should we work on?"),
                                 )
                                 .child(
                                     div()
-                                        .text_color(color(NIGHT.dim))
+                                        .text_color(color(M3.on_surface_variant))
                                         .child("shroom reads, runs and edits code in this folder."),
                                 ),
                         ),
@@ -1519,11 +1374,11 @@ fn welcome(info: &Welcome, m: Metrics, cx: &mut Context<Root>) -> impl IntoEleme
                                     .id("missing-key")
                                     .role(gpui::Role::Button)
                                     .mt(px(6. * z))
-                                    .px(px(12. * z))
-                                    .py(px(8. * z))
-                                    .rounded(px(8. * z))
-                                    .bg(color(0x2a2418))
-                                    .text_color(color(NIGHT.code))
+                                    .px(px(16. * z))
+                                    .py(px(12. * z))
+                                    .rounded(px(shape::LARGE * z))
+                                    .bg(color(M3.error_container))
+                                    .text_color(color(M3.on_error_container))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|root, _, _, cx| {
                                         let outcome = root.chat.press("ctrl+k key");
@@ -1541,13 +1396,18 @@ fn welcome(info: &Welcome, m: Metrics, cx: &mut Context<Root>) -> impl IntoEleme
                         .flex()
                         .flex_col()
                         .gap(px(8. * z))
-                        .child(div().text_size(px(12.5 * z)).text_color(color(NIGHT.muted)).child("Try"))
-                        .children(starters),
+                        .child(
+                            div()
+                                .type_style(m3::font::TITLE_SMALL, z)
+                                .text_color(color(M3.primary))
+                                .child("Try"),
+                        )
+                        .child(starters),
                 )
                 .child(
                     div()
-                        .text_size(px(12.5 * z))
-                        .text_color(color(NIGHT.muted))
+                        .type_style(m3::font::BODY_SMALL, z)
+                        .text_color(color(M3.on_surface_variant))
                         .child("F1 lists every key. Ctrl+P runs any command."),
                 ),
         )
@@ -1555,13 +1415,15 @@ fn welcome(info: &Welcome, m: Metrics, cx: &mut Context<Root>) -> impl IntoEleme
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.focus.is_focused(window) {
+        // Typing goes to the composer unless a component holds focus.
+        if window.focused(cx).is_none() {
             window.focus(&self.focus, cx);
         }
         let z = self.zoom;
         let m = Metrics {
             cell: self.cell(),
             line: self.line(),
+            input: self.input_line(),
             pad: self.pad(),
             zoom: z,
         };
@@ -1583,19 +1445,30 @@ impl Render for Root {
         };
         let main_w = room - sidebar_w;
         let columns = ((main_w - 2. * m.pad) / f32::from(m.cell)).max(10.);
-        // Header and footer are chrome; the rest is the chat's grid (the
-        // composer card adds its padding around the input rows).
-        let chrome_h = (HEADER + FOOTER + PILL_BUTTON + 2. * PILL_PAD + 6.) * z;
-        // Room beside the prompt text for the chip and send (last frame's
-        // chip text; it changes rarely).
-        let measure = self.measure(window);
-        let chip_cells = measure(&self.chip_label, Face::Sans, false) * 12.5 / SANS_SIZE;
-        let room_px = (20. + 6. + PILL_BUTTON + 8. + PILL_PAD + 8.) * z;
+        // The composer's text field stands its icons beside the reading
+        // column; where the window is too narrow for that, the text gives
+        // up the cells the icons need (last frame's column).
+        let (_, field_w) = composer_span(&self.column, m, main_w);
+        let text_w = field_w - 2. * m3_text_field::text_inset(true) * z;
+        let lost = f32::from(m.cell) * self.column.len() as f32 - text_w;
         self.chat
-            .set_input_room((chip_cells + room_px / f32::from(m.cell)).ceil() as usize + 1);
+            .set_input_room((lost / f32::from(m.cell)).ceil().max(0.) as usize);
+        // Header, the gap, the text field's padding and the status row are
+        // chrome; the rest is the chat's grid. Input rows are BodyLarge
+        // lines, taller than grid lines: last frame's count makes room.
+        let input_rows =
+            self.hit_area.last_input + 1 - self.hit_area.first_input.min(self.hit_area.last_input);
+        let chrome_h =
+            (HEADER + COMPOSER_GAP + STATUS + m3_text_field::TEXT_TOP + m3_text_field::VERTICAL)
+                * z
+                + input_rows as f32 * (m.input - m.line);
         // The grid counts a rule and a status row the window doesn't draw.
-        let rows = ((f32::from(viewport.height) - chrome_h - m.pad) / m.line + 2.).max(4.);
+        let rows = ((f32::from(viewport.height) - chrome_h - m.pad / 2.) / m.line + 2.).max(4.);
         let frame = self.chat.frame(columns as usize, rows as usize);
+        self.rendered = std::time::Instant::now();
+        if self.chat.animating() {
+            window.request_animation_frame();
+        }
         self.shown = frame.rows[..frame.viewport.min(frame.rows.len())].to_vec();
         let chrome = frame.chrome.clone();
         if let Some(chrome) = &chrome {
@@ -1613,32 +1486,64 @@ impl Render for Root {
                 self.title = title;
             }
         }
-        // Clicks map to grid cells from here: the transcript's first cell,
-        // and the composer's first text row (its card's border and padding).
-        self.origin = (sidebar_w + m.pad, HEADER * z + m.pad / 2.);
+        // Clicks map to grid cells from here. The body stacks from the
+        // window's bottom edge (left-over pixels go above the transcript):
+        // the status row, the text field (its first text row under the
+        // floated label), the gap, the chips, the dock, the transcript.
         let above = frame.rule;
         let first_input = frame.composer.start;
         let chip_rows = usize::from(frame.chips.is_some());
         let column = frame.column.clone();
+        self.column = column.clone();
+        let (field_left, _) = composer_span(&column, m, main_w);
+        let field_h = m3_text_field::height(frame.composer.len()) * z;
+        let field_top = f32::from(viewport.height) - STATUS * z - field_h;
+        let transcript_top = field_top
+            - COMPOSER_GAP * z
+            - (frame.viewport + frame.dock.len() + chip_rows) as f32 * m.line;
+        self.origin = (sidebar_w + m.pad, transcript_top);
         self.hit_area = HitArea {
             left: sidebar_w,
             top: HEADER * z,
-            bottom: f32::from(viewport.height) - FOOTER * z,
+            bottom: f32::from(viewport.height) - STATUS * z,
             above,
+            field_top,
+            shift: frame.shift * m.line,
             composer: (
-                sidebar_w + m.pad + f32::from(m.cell) * column.start as f32 + 1.,
-                self.origin.1
-                    + (above + frame.dock.len()) as f32 * m.line
-                    + 6. * z
-                    + 1.
-                    + (PILL_PAD + (PILL_BUTTON - LINE_HEIGHT) / 2.) * z
-                    + chip_rows as f32 * m.line,
+                sidebar_w + m.pad + field_left + m3_text_field::text_inset(true) * z,
+                field_top + m3_text_field::TEXT_TOP * z,
             ),
             first_input,
             last_input: frame.composer.end.saturating_sub(1),
             column_start: column.start,
         };
-        let head = chrome.as_ref().map(|chrome| header(chrome, m, cx));
+        let sink: m3_state::Sink = {
+            let root = cx.entity().downgrade();
+            std::rc::Rc::new(move |id, event, _, cx| {
+                let _ = root.update(cx, |root, cx| {
+                    root.chat.control(id, event);
+                    cx.notify();
+                });
+            })
+        };
+        // The composer's field is focused while typing lands in it: the
+        // window's focus is on it and no popup holds the keys.
+        let field_spec = shroom_ui::motion::FieldSpec {
+            focused: self.focus.is_focused(window) && frame.popup.is_none(),
+            populated: self.chat.input_populated(),
+        };
+        let ui = Ui::new(
+            &mut self.chat,
+            &mut self.handles,
+            window,
+            cx,
+            self.places.clone(),
+            sink,
+            self.focus.clone(),
+            z,
+            &M3,
+        );
+        let head = chrome.as_ref().map(|chrome| header(chrome, &ui, cx));
         // The dialog covers the whole window (sidebar and title bar too).
         let mut frame = frame;
         let dialog = frame.popup.take().map(|view| {
@@ -1646,29 +1551,26 @@ impl Render for Root {
                 .as_ref()
                 .map(|chrome| chrome.hints.clone())
                 .unwrap_or_default();
-            popup(view, hints, m, cx).into_any_element()
+            popup(view, hints, m, &ui, cx).into_any_element()
         });
-        if let Some(chrome) = &chrome {
-            self.chip_label = chip_label(chrome);
-        }
-        let chat = &self.chat;
-        let hover = |key: &str| chat.hovered(hover_id(key));
         let body = chat_body(
             frame,
             chrome.clone(),
             m,
             columns as usize,
-            &hover,
-            self.slider.clone(),
+            main_w,
+            field_spec,
+            &ui,
             cx,
         );
         let side = (sidebar_w > 1.)
             .then(|| {
                 chrome
                     .as_ref()
-                    .map(|chrome| sidebar(chrome, m, sidebar_w, cx))
+                    .map(|chrome| sidebar(chrome, m, sidebar_w, &ui, cx))
             })
             .flatten();
+        ui.finish();
         let main = div()
             .id("main")
             .role(gpui::Role::Main)
@@ -1677,7 +1579,7 @@ impl Render for Root {
             .h_full()
             .flex()
             .flex_col()
-            .bg(color(NIGHT.bg))
+            .bg(color(PANE))
             .children(head)
             .child(body);
         div()
@@ -1688,7 +1590,7 @@ impl Render for Root {
             .font_family(SANS)
             .text_size(px(SANS_SIZE * z))
             .line_height(px(m.line))
-            .text_color(color(NIGHT.text))
+            .text_color(color(M3.on_surface))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
@@ -1701,6 +1603,18 @@ impl Render for Root {
             .child(main)
             .children(dialog)
     }
+}
+
+/// The composer's text field across the body (from its left padding, px):
+/// its text lines up with the reading column, the icons' boxes stand
+/// outside it, and it stays inside the body's padding.
+fn composer_span(column: &Range<usize>, m: Metrics, main_w: f32) -> (f32, f32) {
+    let inset = m3_text_field::text_inset(true) * m.zoom;
+    let room = (main_w - 2. * m.pad).max(0.);
+    let left = (f32::from(m.cell) * column.start as f32 - inset).max(0.);
+    let right = (f32::from(m.cell) * column.end as f32 + inset).min(room);
+    let min = (m3_text_field::MIN_WIDTH * m.zoom).min(room);
+    (left.min(room - min), (right - left).max(min))
 }
 
 impl Root {
@@ -1717,8 +1631,9 @@ fn chat_body(
     chrome: Option<Chrome>,
     m: Metrics,
     window_cols: usize,
-    hover: &dyn Fn(&str) -> f32,
-    slider: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    main_w: f32,
+    field_spec: shroom_ui::motion::FieldSpec,
+    ui: &Ui,
     cx: &mut Context<Root>,
 ) -> gpui::AnyElement {
     let z = m.zoom;
@@ -1736,7 +1651,7 @@ fn chat_body(
         dock,
         composer,
         chips,
-        content,
+        content: _,
         column,
         ..
     } = frame;
@@ -1751,8 +1666,8 @@ fn chat_body(
     let cards = cards.into_iter().map(|card| {
         let top = card.top as f32 * m.line + f32::from(shift_px);
         let (bg, radius) = match card.kind {
-            Panel::Prompt => (BUBBLE, 16.),
-            Panel::Code => (0x141414, 8.),
+            Panel::Prompt => (BUBBLE, shape::LARGE_INCREASED),
+            Panel::Code => (CODE_CARD, shape::MEDIUM),
         };
         // The bubble gets a little more air than a code card.
         let (padx, pady) = match card.kind {
@@ -1768,9 +1683,11 @@ fn chat_body(
             .rounded(px(radius * z))
             .bg(color(bg))
             .when(card.kind == Panel::Code, |code| {
-                code.border_1().border_color(color(LINE))
+                code.border_1()
+                    .border_color(color(M3.surface_container_high))
             })
-            .opacity(card.fade * content)
+            // `fade` already carries the transcript's fade (`content`).
+            .opacity(card.fade)
     });
     let transcript = div()
         .id("transcript")
@@ -1790,10 +1707,10 @@ fn chat_body(
         )
         .children(pictures)
         .when_some(empty.filter(|_| dialog.is_none()), |area, info| {
-            area.child(welcome(&info, m, cx))
+            area.child(welcome(&info, m, ui, cx))
         });
     // Below the transcript: dock rows, then (skipping the old rule) the
-    // chips and the composer card; the old status row is the footer now.
+    // chips, the composer's text field, and the status row.
     let first = viewport;
     let take = |range: Range<usize>, below: &mut Vec<ZonedRow>| {
         range
@@ -1802,88 +1719,71 @@ fn chat_body(
             .collect::<Vec<_>>()
     };
     let dock_rows = take(dock.clone(), &mut below);
-    // Chips and prompt rows: their cells from the column's start, inside
-    // the card (the grid centred them with leading spaces).
-    let inside = |range: Range<usize>, below: &Vec<ZonedRow>| {
-        range
-            .filter_map(|at| below.get(at - first).cloned())
-            .map(|(cells, _)| composer_row(layout::slice(&cells, column.start..usize::MAX), m))
-            .collect::<Vec<_>>()
-    };
+    // Prompt rows: their cells from the column's start, inside the field
+    // (the grid centred them with leading spaces).
+    let input_rows = composer
+        .clone()
+        .filter_map(|at| below.get(at - first).cloned())
+        .map(|(cells, _)| {
+            composer_row(
+                layout::slice(&cells, column.start..usize::MAX),
+                field_spec.focused,
+                ui,
+            )
+        })
+        .collect::<Vec<_>>();
+    // Attached images wait as a row of chips above the field.
     let chip_rows = chips
-        .map(|at| inside(at..at + 1, &below))
+        .map(|at| take(at..at + 1, &mut below))
         .unwrap_or_default();
-    let input_rows = inside(composer.clone(), &below);
 
-    // The composer sits under the reading column, as wide as it.
-    let column_left = m.cell * column.start as f32;
-    let column_w = m.cell * column.len() as f32;
+    // The composer's text field: its text on the reading column, the icons
+    // beside it.
+    let (field_left, field_w) = composer_span(&column, m, main_w);
     let generating = chrome.as_ref().is_some_and(|chrome| chrome.generating);
     let can_send = chrome.as_ref().is_some_and(|chrome| chrome.can_send);
     let root = cx.entity();
-    let attach_hover = hover("attach");
-    let attach = gpui_base::Button::new("attach")
-        .aria_label("Attach files")
-        .flex_none()
-        .size(px(PILL_BUTTON * z))
-        .rounded_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .font_family(FONT)
-        .text_size(px(15. * z))
-        .bg(ink(0.06 * attach_hover))
-        .text_color(mix(NIGHT.muted, NIGHT.text, attach_hover))
-        .cursor_pointer()
-        .on_hover(hover_listener("attach", cx))
-        .on_click(move |_, _, cx| {
-            let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
-                files: true,
-                directories: false,
-                multiple: true,
-                prompt: Some("Attach".into()),
-            });
-            let root = root.clone();
-            cx.spawn(async move |cx| {
-                if let Ok(Ok(Some(paths))) = picked.await {
-                    let text: Vec<String> = paths
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect();
-                    let _ = root.update(cx, |root, cx| {
-                        root.chat.paste(&text.join("\n"));
-                        cx.notify();
-                    });
-                }
-            })
-            .detach();
+    let attach = IconButton::new(
+        "attach",
+        IconKind::Standard,
+        m3::icon::ATTACH_FILE,
+        "Attach files",
+    )
+    .on_click(move |_, cx| {
+        let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        let root = root.clone();
+        cx.spawn(async move |cx| {
+            if let Ok(Ok(Some(paths))) = picked.await {
+                let text: Vec<String> = paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                let _ = root.update(cx, |root, cx| {
+                    root.chat.paste(&text.join("\n"));
+                    cx.notify();
+                });
+            }
         })
-        .child(ICON_ATTACH);
-    // The model and effort chip (zeron): opens the effort panel, or the model
-    // list when the model has no levels.
+        .detach();
+    })
+    .render(ui, cx);
+    // The model chip: a filter chip, selected while its menu is open (or,
+    // for a model without effort levels, opening the model list).
     let chip = chrome.as_ref().map(|chrome| {
-        let t = hover("model-chip");
-        let open = chrome.effort.as_ref().is_some_and(|panel| panel.open > 0.5);
+        let open = chrome.effort.as_ref().is_some_and(|panel| panel.expanded);
         let has_levels = chrome.effort.is_some();
-        let level = chrome
-            .effort
-            .as_ref()
-            .and_then(|panel| panel.levels.get(panel.selected).cloned());
         let root = cx.entity();
-        gpui_base::Button::new("model-chip")
-            .aria_label(SharedString::from(format!("Model {}", chip_label(chrome))))
-            .flex_none()
-            .h(px(PILL_BUTTON * z))
-            .px(px(10. * z))
-            .rounded(px(10. * z))
-            .bg(ink(if open { 0.08 } else { 0.05 + 0.04 * t }))
-            .flex()
-            .items_center()
-            .gap(px(6. * z))
-            .text_size(px(12.5 * z))
-            .cursor_pointer()
-            .on_hover(hover_listener("model-chip", cx))
-            .on_click(move |_, _, cx| {
+        m3_chip::FilterChip::new(MODEL_CHIP, chip_label(chrome))
+            .menu(open)
+            .leading(m3::icon::SMART_TOY)
+            .trailing(m3::icon::ARROW_DROP_DOWN)
+            .aria(format!("Model {}", chip_label(chrome)))
+            .on_click(move |_, cx| {
                 root.update(cx, |root, cx| {
                     if has_levels {
                         root.chat.toggle_effort_panel();
@@ -1894,70 +1794,34 @@ fn chat_body(
                     cx.notify();
                 });
             })
-            .child(
-                div()
-                    .font_family(FONT)
-                    .text_size(px(12. * z))
-                    .text_color(color(NIGHT.muted))
-                    .child(ICON_MODEL),
-            )
-            .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(color(NIGHT.text))
-                    .child(SharedString::from(chrome.model.clone())),
-            )
-            .children(level.map(|level| {
-                div()
-                    .text_color(color(NIGHT.muted))
-                    .child(SharedString::from(level))
-            }))
+            .render(ui, cx)
     });
-    let panel = chrome
-        .as_ref()
-        .and_then(|chrome| {
-            chrome
-                .effort
-                .clone()
-                .map(|panel| (chrome.model.clone(), panel))
-        })
-        .filter(|(_, panel)| panel.open > 0.01)
-        .map(|(model, panel)| {
-            effort_panel(model, panel, m, hover, slider.clone(), cx).into_any_element()
-        });
-    let composer_card = div()
-        .id("composer")
-        .role(gpui::Role::MultilineTextInput)
-        .aria_label("Message")
-        .relative()
-        .ml(column_left - px(PILL_LEFT * z))
-        .w(column_w + px((PILL_LEFT + PILL_PAD) * z))
-        .mt(px(6. * z))
-        .p(px(PILL_PAD * z))
-        .rounded(px(26. * z))
-        .bg(color(0x171717))
-        .border_1()
-        .border_color(color(LINE))
-        .shadow_md()
-        .flex()
-        .items_end()
-        .gap(px(6. * z))
-        .child(attach)
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .py(px((PILL_BUTTON - LINE_HEIGHT) / 2. * z))
-                .flex()
-                .flex_col()
-                .children(chip_rows)
-                .children(input_rows),
-        )
-        .children(chip)
-        .child(div().w(px(2. * z)))
-        .child(send_button(generating, can_send, m, cx))
-        .children(panel);
-    // Under the composer: a notice on the left, the context ring on the right.
+    let panel = chrome.as_ref().and_then(|chrome| {
+        let panel = chrome.effort.clone()?;
+        // Unmounted once it has closed (Compose: when the transition settles);
+        // its groups then start afresh, not yet hovered.
+        if !panel.expanded && panel.open <= 0.001 {
+            for group in 0..2 {
+                ui.forget(m3_menu::group_id(EFFORT_MENU, group));
+            }
+            return None;
+        }
+        Some(effort_menu(chrome.model.clone(), panel, m, ui, cx))
+    });
+    let field = m3_text_field::TextField::new(COMPOSER, "Message")
+        .multiline()
+        .placeholder(shroom_ui::chat::PLACEHOLDER)
+        .leading(attach)
+        .trailing(send_button(generating, can_send, ui, cx))
+        .rows(input_rows)
+        .focused(field_spec.focused)
+        .populated(field_spec.populated)
+        .render(ui)
+        .ml(px(field_left))
+        .w(px(field_w))
+        .mt(px(COMPOSER_GAP * z));
+    // Under the composer: the model chip and a notice on the left, the
+    // context ring on the right; the effort menu opens above the chip.
     let notice = chrome
         .as_ref()
         .and_then(|chrome| chrome.notice.clone())
@@ -1970,7 +1834,7 @@ fn chat_body(
                 .flex()
                 .items_center()
                 .gap(px(6. * z))
-                .text_color(color(if good { NIGHT.accent } else { NIGHT.code }))
+                .text_color(color(if good { M3.primary } else { M3.tertiary }))
                 .when(good, |line| line.child("✓"))
                 .child(SharedString::from(text))
         });
@@ -1979,17 +1843,34 @@ fn chat_body(
         .and_then(|chrome| chrome.context)
         .map(|share| context_meter(share, m));
     let status = div()
+        .relative()
         .flex_none()
-        .ml(column_left)
-        .w(column_w)
-        .h(px(FOOTER * z))
+        .ml(px(field_left))
+        .w(px(field_w))
+        .h(px(STATUS * z))
         .flex()
         .items_center()
         .justify_between()
-        .text_size(px(12. * z))
-        .text_color(color(NIGHT.muted))
-        .child(div().min_w(px(0.)).children(notice))
-        .children(context);
+        .type_style(m3::font::BODY_SMALL, z)
+        .text_color(color(M3.on_surface_variant))
+        .child(
+            div()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .gap(px(m3::space::S100 * z))
+                .children(chip)
+                .children(notice),
+        )
+        // The ring stands under the end of the text, inside the field's
+        // trailing icon box.
+        .child(
+            div()
+                .flex_none()
+                .pr(px(m3_text_field::text_inset(true) * z))
+                .children(context),
+        )
+        .children(panel);
     let mut bars_el = Vec::new();
     for mut bar in bars
         .into_iter()
@@ -2012,46 +1893,31 @@ fn chat_body(
         .justify_end()
         .child(transcript)
         .child(div().flex().flex_col().children(dock_rows))
-        .child(composer_card)
+        .child(div().flex().flex_col().children(chip_rows))
+        .child(field)
         .child(status)
         .children(bars_el)
         .into_any_element()
 }
 
-/// Send (or stop, while answering): a round light plate, dim when there is
-/// nothing to send.
+/// Send (or stop, while answering): a filled icon button, disabled when
+/// there is nothing to send.
 fn send_button(
     generating: bool,
     can_send: bool,
-    m: Metrics,
+    ui: &Ui,
     cx: &mut Context<Root>,
-) -> impl IntoElement {
-    let z = m.zoom;
+) -> gpui::AnyElement {
     let (label, glyph) = if generating {
-        ("Stop", ICON_STOP)
+        ("Stop", m3::icon::STOP)
     } else {
-        ("Send", ICON_SEND)
+        ("Send", m3::icon::ARROW_UPWARD)
     };
-    let live = generating || can_send;
     let root = cx.entity();
-    // gpui-base's button owns pointer, Enter/Space and focus behaviour; the
-    // look stays shroom's.
-    gpui_base::Button::new("send")
-        .aria_label(label)
-        .aria_keyshortcuts(if generating { "Escape" } else { "Enter" })
-        .disabled(!live)
-        .flex_none()
-        .size(px(PILL_BUTTON * z))
-        .rounded_full()
-        .bg(color(if live { NIGHT.text } else { 0x2a2a2a }))
-        .flex()
-        .items_center()
-        .justify_center()
-        .font_family(FONT)
-        .text_size(px(13. * z))
-        .text_color(color(if live { NIGHT.bg } else { NIGHT.muted }))
-        .when(live, |button| button.cursor_pointer())
-        .on_click(move |_, _, cx| {
+    IconButton::new("send", IconKind::Filled, glyph, label)
+        .size(Size::Small)
+        .enabled(generating || can_send)
+        .on_click(move |_, cx| {
             root.update(cx, |root, cx| {
                 if generating {
                     root.chat.stop();
@@ -2062,38 +1928,7 @@ fn send_button(
                 cx.notify();
             });
         })
-        .child(glyph)
-}
-
-/// A stable id for a hover target.
-fn hover_id(key: &str) -> u64 {
-    key.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-    })
-}
-
-/// Pointer in/out of `key`: its highlight fades (Chat runs the spring).
-fn hover_listener(
-    key: &'static str,
-    cx: &mut Context<Root>,
-) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
-    let root = cx.entity();
-    move |on: &bool, _, cx| {
-        let on = *on;
-        root.update(cx, |root, cx| {
-            root.chat.hover(hover_id(key), on);
-            cx.notify();
-        });
-    }
-}
-
-/// White ink at `alpha` (hover and chip plates, as zeron's `ink`).
-fn ink(alpha: f32) -> Hsla {
-    hsla(0., 0., 1., alpha.clamp(0., 1.))
-}
-
-fn mix(from: u32, to: u32, t: f32) -> Hsla {
-    color(shroom_ui::motion::mix(from, to, f64::from(t.clamp(0., 1.))))
+        .render(ui, cx)
 }
 
 /// The chip's text: the model and its effort level.
@@ -2103,220 +1938,152 @@ fn chip_label(chrome: &Chrome) -> String {
         .as_ref()
         .and_then(|panel| panel.levels.get(panel.selected))
     {
-        Some(level) => format!("{}  {level}", chrome.model),
+        Some(level) => format!("{} · {level}", chrome.model),
         None => chrome.model.clone(),
     }
 }
 
-/// The model and effort panel (zeron's compact picker), above the chip:
-/// the level and model as a link to the model list, then a slider over the
-/// model's levels. It pops open and folds away; the thumb glides.
-fn effort_panel(
+/// The model chip's control key.
+const MODEL_CHIP: &str = "model-chip";
+/// The composer's text field's control key.
+const COMPOSER: &str = "composer";
+const EFFORT_MENU: &str = "effort-menu";
+
+/// The model and effort menu above the chip (Compose's expressive
+/// `DropdownMenuPopup`): a group with the model, which opens the model
+/// list, and a group of the effort levels to pick from. It scales from 0.8
+/// and fades in; the scale is drawn as a zoom, pivoting where Compose's
+/// transform origin is: the bottom (it opens above its anchor), at the
+/// centre of where it overlaps the chip.
+fn effort_menu(
     model: String,
     panel: shroom_ui::chat::EffortPanel,
     m: Metrics,
-    hover: &dyn Fn(&str) -> f32,
-    slider: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    ui: &Ui,
     cx: &mut Context<Root>,
-) -> impl IntoElement {
-    let z = m.zoom;
-    let open = panel.open.clamp(0., 1.2);
-    let level = panel
-        .levels
-        .get(panel.selected)
-        .cloned()
-        .unwrap_or_default();
-    let count = panel.levels.len();
-    let link = hover("effort-model");
+) -> gpui::AnyElement {
+    // The fast spatial spring overshoots 1 by about 2 % before it settles.
+    // Compose draws that as a sub-pixel scale of the finished layer; here the
+    // menu is laid out again at each size, so the overshoot came out as the
+    // box and its re-rasterised text stepping a pixel out and back over the
+    // last frames. It is drawn up to 1 and held there.
+    let s = panel.scale.clamp(0., 1.);
+    let z = m.zoom * s;
+    // Its width, from the text at full size: the scale then shrinks one
+    // fixed shape (Compose's graphicsLayer) instead of laying it out anew.
+    let width = {
+        let text = |line: &str, ty| m3_state::text_width(line, ty, cx);
+        let model_text =
+            text(&model, m3_menu::LABEL).max(text("Change model", m3_menu::SUPPORTING));
+        let (_, start, end) = m3_menu::GROUP_LABEL;
+        let widest = panel
+            .levels
+            .iter()
+            .map(|level| m3_menu::item_width(text(level, m3_menu::LABEL), true, false))
+            .fold(m3_menu::item_width(model_text, true, true), f32::max)
+            .max(start + text("Thinking effort", m3_menu::LABEL) + end);
+        // Kerning and rounding slack.
+        m3_menu::width(widest + 2.)
+    };
     let root = cx.entity();
-    let title = gpui_base::Button::new("effort-model")
-        .aria_label(SharedString::from(format!(
-            "{level} · {model} · Change model"
-        )))
-        .h(px(48. * z))
-        .px(px(8. * z))
-        .rounded(px(7. * z))
-        .bg(ink(0.05 * link))
-        .flex()
-        .items_center()
-        .gap(px(10. * z))
-        .cursor_pointer()
-        .on_hover(hover_listener("effort-model", cx))
-        .on_click(move |_, _, cx| {
-            root.update(cx, |root, cx| {
-                root.chat.close_effort_panel();
-                let outcome = root.chat.press("ctrl+l model");
-                root.apply(outcome, cx);
-                cx.notify();
-            });
-        })
-        .child(
-            div()
-                .font_family(FONT)
-                .text_size(px(13. * z))
-                .text_color(color(NIGHT.muted))
-                .child(ICON_MODEL),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .text_size(px(14. * z))
-                        .line_height(px(17. * z))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(color(NIGHT.text))
-                        .child(SharedString::from(level.clone())),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(3. * z + 3. * z * link))
-                        .text_size(px(12. * z))
-                        .line_height(px(16. * z))
-                        .text_color(mix(NIGHT.muted, NIGHT.text, link))
-                        .child(SharedString::from(model))
-                        .child(
-                            div()
-                                .font_family(FONT)
-                                .text_size(px(10. * z))
-                                .child("\u{f105}"),
-                        ),
-                ),
-        );
-    let thumb = panel.thumb;
-    let accent = color(NIGHT.accent);
-    let drag = cx.entity().downgrade();
-    let rail = canvas(
-        move |bounds, _, _| slider.set(Some(bounds)),
-        move |bounds, (), window, _| {
-            // Window-wide listeners (as zeron's slider): a drag keeps going
-            // outside the rail, and the panel occluding the root doesn't
-            // swallow it.
-            let moved = drag.clone();
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                if phase == gpui::DispatchPhase::Bubble
-                    && event.pressed_button == Some(MouseButton::Left)
-                {
-                    let _ = moved.update(cx, |root, cx| {
-                        if root.sliding {
-                            root.slide_to(event.position.x, count);
-                            cx.notify();
-                        }
-                    });
-                }
-            });
-            let released = drag.clone();
-            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
-                if phase == gpui::DispatchPhase::Bubble {
-                    let _ = released.update(cx, |root, cx| {
-                        if std::mem::take(&mut root.sliding) {
-                            cx.notify();
-                        }
-                    });
-                }
-            });
-            let width = f32::from(bounds.size.width);
-            let inset = THUMB_W / 2. * z;
-            let run = (width - 2. * inset).max(0.);
-            let centre = inset + thumb * run;
-            let top = (SLIDER_H - RAIL_H) / 2. * z;
-            let rect = |x: f32, y: f32, w: f32, h: f32| Bounds {
-                origin: bounds.origin + gpui::point(px(x), px(y)),
-                size: size(px(w), px(h)),
-            };
-            window.paint_quad(gpui::quad(
-                rect(0., top, width, RAIL_H * z),
-                px(RAIL_H / 2. * z),
-                ink(0.06),
-                px(1.),
-                ink(0.08),
-                Default::default(),
-            ));
-            window.paint_quad(
-                gpui::fill(
-                    rect(0., top, (centre + RAIL_H / 2. * z).min(width), RAIL_H * z),
-                    accent.opacity(0.85),
-                )
-                .corner_radii(px(RAIL_H / 2. * z)),
-            );
-            for stop in 0..count {
-                let at = if count > 1 {
-                    stop as f32 / (count - 1) as f32
-                } else {
-                    0.
-                };
-                let x = inset + at * run;
-                let tone = if at <= thumb + 1e-3 {
-                    ink(0.4)
-                } else {
-                    hsla(0., 0., 0.6, 0.28)
-                };
-                window.paint_quad(
-                    gpui::fill(
-                        rect(x - 2. * z, SLIDER_H / 2. * z - 2. * z, 4. * z, 4. * z),
-                        tone,
-                    )
-                    .corner_radii(px(2. * z)),
-                );
-            }
-            let thumb_box = rect(
-                centre - THUMB_W / 2. * z,
-                (SLIDER_H - THUMB_H) / 2. * z,
-                THUMB_W * z,
-                THUMB_H * z,
-            );
-            window.paint_quad(
-                gpui::fill(thumb_box, hsla(0., 0., 0.96, 1.)).corner_radii(px(THUMB_H / 2. * z)),
-            );
-        },
-    )
-    .size_full();
-    let slide = div()
-        .id("effort-slider")
-        .role(gpui::Role::Slider)
-        .aria_label("Reasoning effort")
-        .aria_value(SharedString::from(level))
-        .mx(px(8. * z))
-        .mt(px(2. * z))
-        .mb(px(4. * z))
-        .h(px(SLIDER_H * z))
-        .cursor_pointer()
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |root, event: &MouseDownEvent, _, cx| {
-                root.sliding = true;
-                root.slide_to(event.position.x, count);
-                cx.stop_propagation();
-                cx.notify();
-            }),
-        )
-        .child(rail);
-    // menu-in: rises 6 px and fades in as it pops open (spring overshoot
-    // reads as zeron's scale).
-    div()
-        .id("effort-panel")
-        .role(gpui::Role::Dialog)
-        .aria_label("Model and effort")
+    let groups = [
+        m3_menu::Group::new(EFFORT_MENU, 0, 2, ui),
+        m3_menu::Group::new(EFFORT_MENU, 1, 2, ui),
+    ];
+    // Every height in the menu is measured off one ruler, top to bottom, so
+    // the menu grows a device pixel at a time as it scales (see `Ruler`).
+    let mut ruler = m3_state::Ruler::new(z, ui.device);
+    let model_top = m3_menu::Group::open(&mut ruler);
+    let pick_model = {
+        let root = root.clone();
+        m3_menu::MenuItem::new("effort-menu-model", model.clone())
+            .supporting("Change model")
+            .leading(m3::icon::SMART_TOY)
+            .trailing(m3::icon::CHEVRON_RIGHT)
+            .aria(format!("Model {model}. Change model"))
+            .edges(&groups[0], true, true)
+            .ruled(&mut ruler)
+            .on_click(move |_, cx| {
+                root.update(cx, |root, cx| {
+                    root.chat.close_effort_panel();
+                    let outcome = root.chat.press("ctrl+l model");
+                    root.apply(outcome, cx);
+                    cx.notify();
+                })
+            })
+            .render(ui, z, cx)
+    };
+    let [model_group, level_group] = groups;
+    let model_group = model_group.render(model_top, vec![pick_model], &mut ruler, ui, z);
+    let gap = m3_menu::gap(&mut ruler);
+    let levels_top = m3_menu::Group::open(&mut ruler);
+    let count = panel.levels.len();
+    let mut levels = vec![m3_menu::group_label("Thinking effort", &mut ruler, ui, z)];
+    for (n, level) in panel.levels.iter().enumerate() {
+        let root = root.clone();
+        let item = m3_menu::MenuItem::new(format!("effort-menu-level-{n}"), level.clone())
+            .selected(n == panel.selected)
+            .selected_leading(m3::icon::CHECK)
+            .place(n, count)
+            .edges(&level_group, false, n + 1 == count)
+            .ruled(&mut ruler)
+            .on_click(move |_, cx| {
+                root.update(cx, |root, cx| {
+                    root.chat.set_effort_at(n);
+                    cx.notify();
+                })
+            })
+            .render(ui, z, cx);
+        levels.push(item);
+    }
+    let groups = vec![
+        model_group,
+        gap,
+        level_group.render(levels_top, levels, &mut ruler, ui, z),
+    ];
+    // The pivot: the centre of the menu's overlap with the chip (both
+    // left-aligned), so the left edge moves in by (1 - s) of half of it.
+    let chip = ui
+        .places()
+        .borrow()
+        .get(&m3_state::control_id(MODEL_CHIP))
+        .map_or(0., |bounds| f32::from(bounds.size.width));
+    let inward = (1. - s) * chip.min(width * m.zoom) / 2.;
+    m3_menu::popup(EFFORT_MENU, "Model and effort", groups, panel.open)
         .absolute()
-        .right(px((PILL_PAD + PILL_BUTTON + 6.) * z))
-        .bottom(px((PILL_BUTTON + 2. * PILL_PAD + 8. - 6. * (1. - open)) * z))
-        .w(px(PANEL_W * z))
-        .opacity(open.min(1.))
+        .w(px(width * z))
+        // Left-aligned with the chip, which starts the status row.
+        .left(px(inward))
+        // Above its anchor, the chip's 48 target (the status row).
+        .bottom(px(STATUS * m.zoom))
         .occlude()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .p(px(4. * z))
-        .rounded(px(12. * z))
-        .bg(color(0x1a1a1a))
-        .border_1()
-        .border_color(color(0x2a2a2a))
-        .shadow_lg()
-        .flex()
-        .flex_col()
-        .child(title)
-        .child(slide)
+        .child(m3_state::measure(
+            ui.places(),
+            m3_state::control_id(EFFORT_MENU),
+        ))
+        .into_any_element()
+}
+
+/// The bundled faces: Shroom Sans and the Material Symbols icon fonts.
+fn load_fonts(window: &Window) {
+    let added = window.text_system().add_fonts(vec![
+        std::borrow::Cow::Borrowed(include_bytes!("../fonts/ShroomSans-Regular.ttf").as_slice()),
+        std::borrow::Cow::Borrowed(include_bytes!("../fonts/ShroomSans-SemiBold.ttf").as_slice()),
+        std::borrow::Cow::Borrowed(include_bytes!("../fonts/ShroomSans-Italic.ttf").as_slice()),
+        std::borrow::Cow::Borrowed(include_bytes!("../fonts/ShroomSans-Medium.ttf").as_slice()),
+        std::borrow::Cow::Borrowed(
+            include_bytes!("../fonts/MaterialSymbols-Outlined.ttf").as_slice(),
+        ),
+        std::borrow::Cow::Borrowed(
+            include_bytes!("../fonts/MaterialSymbols-Filled.ttf").as_slice(),
+        ),
+    ]);
+    // gpui keeps going without a font it could not read; the families
+    // still resolve (to a fallback), so a failure here is only logged.
+    if let Err(err) = added {
+        eprintln!("shroom: bundled fonts: {err}");
+    }
 }
 
 fn main() {
@@ -2324,18 +2091,26 @@ fn main() {
         println!("shroom {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    application().run(|cx: &mut App| {
+    let gallery = std::env::args().any(|arg| arg == "--gallery");
+    application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
-        let opened = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                // Matches the launcher entry (StartupWMClass) so docks and
-                // window lists show it as shroom.
-                app_id: Some("shroom".into()),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| Root::new(window, cx)),
-        );
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // Matches the launcher entry (StartupWMClass) so docks and
+            // window lists show it as shroom.
+            app_id: Some("shroom".into()),
+            ..Default::default()
+        };
+        let opened = if gallery {
+            // Every component in its states (see `m3_gallery`).
+            cx.open_window(options, |window, cx| {
+                cx.new(|cx| m3_gallery::Gallery::new(window, cx))
+            })
+            .map(drop)
+        } else {
+            cx.open_window(options, |window, cx| cx.new(|cx| Root::new(window, cx)))
+                .map(drop)
+        };
         if let Err(err) = opened {
             eprintln!("shroom: cannot open a window: {err}");
             cx.quit();

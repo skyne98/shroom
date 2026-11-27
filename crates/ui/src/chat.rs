@@ -26,7 +26,7 @@ use shroom_core::DocId;
 
 use crate::editor::Editor;
 use crate::layout::{self, ACCENT, DIM, Laid, Paint, Row, TEXT, run};
-use crate::motion::{self, Ease, Key as Anim, Motions, Spring};
+use crate::motion::{self, Ease, Key as Anim, MENU_CLOSED_SCALE, Motions, Spring};
 use crate::popup::{self, Popup};
 use crate::{Clock, Item, Mode, NIGHT, Picker, hints, spinner_word};
 
@@ -190,10 +190,12 @@ pub struct EffortPanel {
     /// `High`, `Max`, … (capitalised).
     pub levels: Vec<String>,
     pub selected: usize,
-    /// The thumb, 0..1 along the rail, gliding to `selected`.
-    pub thumb: f32,
-    /// 0 closed, 1 open (pops open, folds away).
+    /// Opacity, 0 closed to 1 open (Compose's menu: fast effects).
     pub open: f32,
+    /// Scale, 0.8 closed to 1 open (fast spatial: it overshoots).
+    pub scale: f32,
+    /// Asked open (the motion may still be on its way either way).
+    pub expanded: bool,
 }
 
 /// One picture on screen.
@@ -1200,6 +1202,8 @@ pub const COLUMN: usize = 110;
 
 /// Prompt rows shown at most; more scroll inside the box.
 const INPUT_ROWS: usize = 6;
+/// What the empty prompt suggests.
+pub const PLACEHOLDER: &str = "Do anything…";
 
 /// Which list the picker popup is showing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1365,6 +1369,8 @@ pub struct Chat {
     /// Pointer-hover targets by the client's element id; the highlights
     /// fade toward them in `frame_at`.
     hover_targets: HashMap<u64, bool>,
+    /// The window's Material components: state layers, ripples, shapes.
+    controls: motion::Controls,
     /// Last frame's transcript: first content row shown, top padding rows,
     /// and the rows below the stored ones (the answer in flight).
     shown_from: (usize, usize),
@@ -1488,6 +1494,7 @@ impl Chat {
             effort_open: false,
             input_room: 0,
             hover_targets: HashMap::new(),
+            controls: motion::Controls::default(),
             shown_from: (0, 0),
             tail_rows: Vec::new(),
             retrying: None,
@@ -1516,6 +1523,23 @@ impl Chat {
         {
             self.paste(&prompt);
             self.send();
+        }
+        self
+    }
+
+    /// `--resume`: open the most recently used session of this directory
+    /// instead of a fresh one (stays fresh when there is none).
+    pub fn resumed(mut self) -> Self {
+        let fresh = self.client.app().selected().map(|doc| doc.id);
+        let last = self
+            .sessions()
+            .into_iter()
+            .find(|session| Some(session.id) != fresh && session.turns > 0);
+        if let Some(last) = last {
+            self.open_session(last.id);
+            if let Some(fresh) = fresh {
+                self.dispatch(Action::Close(fresh));
+            }
         }
         self
     }
@@ -1692,6 +1716,31 @@ impl Chat {
         self.motions.value(&Anim::Hover(id)).unwrap_or(0.0) as f32
     }
 
+    /// Input reached the window's component `id` (hover, press, release).
+    pub fn control(&mut self, id: u64, event: motion::ControlEvent) {
+        self.controls.event(id, event);
+    }
+
+    /// Component `id` is no longer drawn: forget its states.
+    pub fn forget_control(&mut self, id: u64) {
+        self.controls.forget(&mut self.motions, id);
+    }
+
+    /// Component `id`'s animated look this frame, as `spec` says it is.
+    pub fn control_look(&mut self, id: u64, spec: motion::ControlSpec) -> motion::ControlLook {
+        self.controls.look(&mut self.motions, id, spec)
+    }
+
+    /// Text field `id`'s animated look this frame.
+    pub fn field_look(&mut self, id: u64, spec: motion::FieldSpec) -> motion::FieldLook {
+        self.controls.field(&mut self.motions, id, spec)
+    }
+
+    /// The composer holds text.
+    pub fn input_populated(&self) -> bool {
+        !self.editor.text().is_empty()
+    }
+
     /// Cells beside the prompt text kept for the window's buttons.
     pub fn set_input_room(&mut self, cells: usize) {
         self.input_room = cells;
@@ -1734,13 +1783,13 @@ impl Chat {
     /// True while something moves or an answer is in flight: clients redraw
     /// every [`Chat::frame_interval`] then.
     pub fn animating(&self) -> bool {
-        self.clock.generating() || self.motions.active()
+        self.clock.generating() || self.motions.active() || self.controls.busy()
     }
 
     /// How soon the next frame is due: one display frame while something
     /// moves, a slow tick otherwise.
     pub fn frame_interval(&self) -> std::time::Duration {
-        if self.motions.active() {
+        if self.motions.active() || self.controls.busy() {
             motion::FAST
         } else {
             motion::SLOW
@@ -1785,10 +1834,12 @@ impl Chat {
         (from != to).then_some((from, to))
     }
 
-    /// Selected transcript text, one line per row, without trailing blanks.
+    /// Selected transcript text: rows a soft wrap split join again (their
+    /// hanging indent dropped), real line ends stay; no trailing blanks.
     fn picked_text(&self) -> Option<String> {
         let ((r0, c0), (r1, c1)) = self.picked_span()?;
-        let lines: Vec<String> = (r0..=r1)
+        // (text, continues into the next row with this joint)
+        let rows: Vec<(String, Option<&'static str>)> = (r0..=r1)
             .map(|index| {
                 let row = self.content_row(index).unwrap_or_default();
                 let from = if index == r0 { c0 } else { 0 };
@@ -1797,21 +1848,32 @@ impl Chat {
                     .iter()
                     .map(|run| run.text.as_str())
                     .collect();
-                text.trim_end().to_string()
+                (text.trim_end().to_string(), layout::soft_break(&row))
             })
             .collect();
-        // Drop the layout's left gutter (the answer marker and indent).
-        let gutter = lines
+        // Drop the layout's left gutter (the answer marker and indent),
+        // judged on rows that start a line (continuations hang deeper).
+        let lead = |line: &str| line.chars().take_while(|c| *c == ' ' || *c == '●').count();
+        let starts = |n: usize| n == 0 || rows[n - 1].1.is_none();
+        let gutter = rows
             .iter()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| line.chars().take_while(|c| *c == ' ' || *c == '●').count())
+            .enumerate()
+            .filter(|(n, (line, _))| starts(*n) && !line.trim().is_empty())
+            .map(|(_, (line, _))| lead(line))
             .min()
             .unwrap_or(0);
-        let text = lines
-            .iter()
-            .map(|line| line.chars().skip(gutter).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut text = String::new();
+        for (n, (line, joint)) in rows.iter().enumerate() {
+            let line = if starts(n) {
+                line.chars().skip(gutter).collect::<String>()
+            } else {
+                line.trim_start().to_string()
+            };
+            text.push_str(&line);
+            if n + 1 < rows.len() {
+                text.push_str(joint.unwrap_or("\n"));
+            }
+        }
         let text = text.trim_matches('\n').to_string();
         (!text.is_empty()).then_some(text)
     }
@@ -1923,6 +1985,8 @@ impl Chat {
                     open.insert(key);
                 }
                 self.cache = None;
+                // Rows below the fold move: the selection would land on others.
+                self.picked = None;
                 return Outcome::Redraw;
             }
             None if self.mode == Mode::Chat && row < self.viewport => {
@@ -1937,7 +2001,26 @@ impl Chat {
                         let (a, b) = self.word_at(index, col);
                         ((index, a), (index, b))
                     }
-                    _ => ((index, 0), (index, usize::MAX / 2)),
+                    // The wrapped line the row belongs to, all of its rows.
+                    _ => {
+                        let mut first = index;
+                        while first > 0
+                            && self
+                                .content_row(first - 1)
+                                .is_some_and(|row| layout::soft_break(&row).is_some())
+                        {
+                            first -= 1;
+                        }
+                        let mut last = index;
+                        while self
+                            .content_row(last)
+                            .is_some_and(|row| layout::soft_break(&row).is_some())
+                            && self.content_row(last + 1).is_some()
+                        {
+                            last += 1;
+                        }
+                        ((first, 0), (last, usize::MAX / 2))
+                    }
                 });
                 self.picking = true;
                 return Outcome::Redraw;
@@ -2573,11 +2656,12 @@ impl Chat {
         // The effort panel takes ←/→ and closes on Esc or Enter.
         if self.effort_open {
             match key {
-                Key::Left => {
+                // The levels stand in a column: ↑/↓, and ←/→ as before.
+                Key::Left | Key::Up => {
                     self.step_effort(-1);
                     return Outcome::Redraw;
                 }
-                Key::Right => {
+                Key::Right | Key::Down => {
                     self.step_effort(1);
                     return Outcome::Redraw;
                 }
@@ -2790,10 +2874,8 @@ impl Chat {
                 self.rename(*id, &name);
             }
         }
-        match self.sessions().first().map(|session| session.id) {
-            Some(id) => self.dispatch(Action::Select(id)),
-            None => self.dispatch(Action::New),
-        }
+        // Start fresh; earlier sessions stay in the picker.
+        self.dispatch(Action::New);
     }
 
     /// Give session `id` a name, without leaving the one on screen.
@@ -3970,6 +4052,7 @@ impl Chat {
                 .ease(Anim::Hover(*id), f64::from(u8::from(*on)), Ease::HOVER_FADE);
         }
         self.hover_targets.retain(|_, on| *on);
+        self.controls.frame(&mut self.motions);
         // Everything below lays out one column of `cols` cells; it is then
         // centered in the window.
         let window = window.max(10);
@@ -4018,7 +4101,7 @@ impl Chat {
         let input_width = width.saturating_sub(self.input_room).max(12);
         let (input, caret) = layout::input(
             &self.editor,
-            "Do anything…",
+            PLACEHOLDER,
             input_width,
             self.mode == Mode::Chat,
         );
@@ -4171,6 +4254,16 @@ impl Chat {
         let faded = |index: usize| {
             let mut row = content[index].clone();
             let t = self.motions.value(&Anim::Row(index)).unwrap_or(1.0) * whole_fade;
+            if self.pixels && t < 1.0 {
+                // The window draws panel fill as cards (which fade on their
+                // own); faded, the fill would no longer read as panel and
+                // show as bands over the text.
+                for run in row.iter_mut() {
+                    if run.paint.bg == Some(NIGHT.surface) {
+                        run.paint.bg = None;
+                    }
+                }
+            }
             motion::fade(&mut row, NIGHT.bg, t);
             row
         };
@@ -4488,21 +4581,15 @@ impl Chat {
             .effort()
             .and_then(|effort| levels.iter().position(|level| *level == effort))
             .unwrap_or(0);
-        let target = if levels.len() > 1 {
-            selected as f64 / (levels.len() - 1) as f64
-        } else {
-            0.0
-        };
-        let thumb = self.motions.ease(Anim::Effort, target, Ease::RESIZE) as f32;
-        // zeron's menu-in / menu-out.
-        let open = self.motions.ease(
-            Anim::EffortPanel,
-            f64::from(u8::from(self.effort_open)),
-            if self.effort_open {
-                Ease::MENU_IN
-            } else {
-                Ease::MENU_OUT
-            },
+        // Compose's DropdownMenuPopup: the same springs in and out.
+        let on = f64::from(u8::from(self.effort_open));
+        let open = self
+            .motions
+            .follow(Anim::EffortPanel, on, Spring::FAST_EFFECTS) as f32;
+        let scale = self.motions.follow(
+            Anim::EffortScale,
+            MENU_CLOSED_SCALE + (1.0 - MENU_CLOSED_SCALE) * on,
+            Spring::FAST_SPATIAL,
         ) as f32;
         let capital = |text: &str| -> String {
             let mut chars = text.chars();
@@ -4514,8 +4601,9 @@ impl Chat {
         Some(EffortPanel {
             levels: levels.iter().map(|level| capital(level.label())).collect(),
             selected,
-            thumb,
-            open,
+            open: open.clamp(0.0, 1.0),
+            scale,
+            expanded: self.effort_open,
         })
     }
 
@@ -4642,12 +4730,18 @@ impl Chat {
             // zeron). Row fades and the scroll motion would replay on the
             // new row numbers, so they settle at once.
             Some(before) if before.doc == doc && before.width != width && !refade => {
+                // The selection was in the old rows' cells.
+                self.picked = None;
+                self.picking = false;
                 self.motions.forget_rows();
                 self.motions.snap(Anim::Scroll, self.scroll as f64);
             }
             // Another session or a rewound chat: a different picture, fade
             // it in.
             Some(before) if before.doc != doc || refade => {
+                // Another picture: the selection's rows are not in it.
+                self.picked = None;
+                self.picking = false;
                 self.motions.forget_rows();
                 self.motions.enter(Anim::Content, 0.0, 1.0, Ease::FADE_IN);
                 self.motions.snap(Anim::Scroll, self.scroll as f64);
@@ -5028,6 +5122,78 @@ mod tests {
     }
 
     #[test]
+    fn copying_a_wrapped_paragraph_joins_its_rows_and_keeps_line_ends() {
+        let para = "one two three four five six seven eight nine ten eleven twelve thirteen";
+        let body = format!(
+            "{}{para}\n\n- first item that also wraps past the narrow column here\n",
+            crate::user_turn("hi"),
+        );
+        let (chat, dir) = super::motion_tests::chat_in_dir();
+        let mut chat = chat.with_mouse().with_reduced_motion(true);
+        chat.dispatch(shroom_core::Action::Append(body));
+        let frame = chat.frame(40, 30);
+        let line =
+            |r: &crate::layout::Row| r.iter().map(|run| run.text.as_str()).collect::<String>();
+        let first = frame
+            .rows
+            .iter()
+            .position(|r| line(r).contains("one two"))
+            .expect("answer shown");
+        let last = frame
+            .rows
+            .iter()
+            .position(|r| line(r).contains("past"))
+            .expect("item shown");
+        assert!(last > first + 2, "the paragraph wraps");
+        // Triple click: the whole wrapped paragraph, one line.
+        chat.click(first + 1, 4, 3, super::Mods::default());
+        assert_eq!(chat.release().as_deref(), Some(para));
+        // A drag over both: the paragraph, a real line end, the item joined.
+        chat.click(first, 0, 1, super::Mods::default());
+        chat.drag(last + 1, 39);
+        let text = chat.release().expect("selected");
+        assert!(text.starts_with(para), "{text:?}");
+        assert!(
+            text.contains("first item that also wraps past the narrow column here"),
+            "{text:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn switching_sessions_drops_the_transcript_selection() {
+        let (chat, dir) = super::motion_tests::chat_in_dir();
+        let mut chat = chat.with_mouse().with_reduced_motion(true);
+        chat.dispatch(shroom_core::Action::Append(format!(
+            "{}hello there world\n",
+            crate::user_turn("hi")
+        )));
+        let frame = chat.frame(80, 20);
+        let at = frame
+            .rows
+            .iter()
+            .position(|r| r.iter().any(|run| run.text.contains("hello")))
+            .expect("answer shown");
+        chat.click(at, 4, 3, super::Mods::default());
+        assert!(chat.release().is_some());
+        let first = chat.client.app().selected().expect("a session").id;
+        chat.dispatch(shroom_core::Action::New);
+        chat.frame(80, 20);
+        assert_eq!(chat.picked, None, "the other session has no selection");
+        chat.open_session(first);
+        let frame = chat.frame(80, 20);
+        assert!(
+            frame
+                .rows
+                .iter()
+                .flatten()
+                .all(|run| run.paint.bg != Some(crate::NIGHT.select)),
+            "no stale highlight"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn finished_work_folds_and_opens_on_click_or_ctrl_o() {
         let body = format!(
             "{}{}",
@@ -5337,6 +5503,295 @@ mod motion_tests {
     /// A fresh chat in its own data dir, for other test modules.
     pub(super) fn chat_in_dir() -> (Chat, std::path::PathBuf) {
         chat()
+    }
+
+    #[test]
+    fn selection_colours_and_icon_fill_glide_both_ways() {
+        // A drawer item or toggle's selection: colours and the icon's fill
+        // (outlined to filled) move on the default effects spring, not cut.
+        use crate::motion::ControlSpec;
+        let (mut chat, dir) = chat();
+        let t0 = Instant::now();
+        let off = ControlSpec::default();
+        let on = ControlSpec {
+            checked: true,
+            ..off
+        };
+        chat.frame_at(COLS, ROWS, t0);
+        assert_eq!(chat.control_look(9, off).checked, 0.0);
+        let mut run = |spec: ControlSpec, from: u32| {
+            let mut seen = Vec::new();
+            for n in from..from + 24 {
+                chat.frame_at(COLS, ROWS, t0 + n * FRAME);
+                seen.push(chat.control_look(9, spec).checked);
+            }
+            seen
+        };
+        let fill = run(on, 1);
+        assert!(fill[0] < 0.5, "a glide, not a cut: {fill:?}");
+        assert!(fill.windows(2).all(|p| p[1] >= p[0]), "{fill:?}");
+        assert!(fill[7] >= 0.9, "90 % within 120 ms: {fill:?}");
+        assert_eq!(fill[19], 1.0, "at rest by 320 ms: {fill:?}");
+        let clear = run(off, 30);
+        assert!(clear[0] > 0.5, "{clear:?}");
+        assert!(clear.windows(2).all(|p| p[1] <= p[0]), "{clear:?}");
+        assert_eq!(clear[19], 0.0, "{clear:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_text_field_floats_its_label_and_fades_its_placeholder_on_focus() {
+        // Compose's TextFieldImpl transition: focusing an empty field floats
+        // the label (fast spatial), turns label and indicator to the focus
+        // colour (fast effects), thickens the indicator (fast spatial) and
+        // fades the placeholder in (slow effects in Compose; default
+        // effects here, see Controls::field). Blurring with text keeps the
+        // label up and hides the placeholder; emptying rests the label.
+        use crate::motion::FieldSpec;
+        let (mut chat, dir) = chat();
+        let t0 = Instant::now();
+        let rest = FieldSpec::default();
+        let focused = FieldSpec {
+            focused: true,
+            populated: false,
+        };
+        chat.frame_at(COLS, ROWS, t0);
+        let first = chat.field_look(4, rest);
+        assert_eq!(
+            (first.label, first.focus, first.indicator, first.placeholder),
+            (0.0, 0.0, 0.0, 0.0),
+            "starts at rest, not animating in"
+        );
+        let mut run = |spec: FieldSpec, from: u32| {
+            (from..from + 26)
+                .map(|n| {
+                    chat.frame_at(COLS, ROWS, t0 + n * FRAME);
+                    chat.field_look(4, spec)
+                })
+                .collect::<Vec<_>>()
+        };
+        let on = run(focused, 1);
+        let label: Vec<f32> = on.iter().map(|look| look.label).collect();
+        let focus: Vec<f32> = on.iter().map(|look| look.focus).collect();
+        let shown: Vec<f32> = on.iter().map(|look| look.placeholder).collect();
+        let thick: Vec<f32> = on.iter().map(|look| look.indicator).collect();
+        assert!(label[0] < 0.5, "a float, not a jump: {label:?}");
+        assert!(label[7] >= 0.9, "90 % within 120 ms: {label:?}");
+        assert!(
+            label.iter().all(|v| *v <= 1.1),
+            "fast spatial overshoots a little: {label:?}"
+        );
+        // Fast spatial rests within 400 ms (motion.rs holds it to that).
+        assert_eq!(label[24], 1.0, "at rest by 400 ms: {label:?}");
+        assert_eq!(thick[24], 1.0, "{thick:?}");
+        for seen in [&focus, &shown] {
+            assert!(seen[0] < 0.5, "{seen:?}");
+            assert!(seen.windows(2).all(|p| p[1] >= p[0]), "{seen:?}");
+            assert!(seen[7] >= 0.9, "{seen:?}");
+            assert_eq!(seen[19], 1.0, "{seen:?}");
+        }
+        // Blurred with text: label stays floated, colours and placeholder go.
+        let typed = FieldSpec {
+            focused: false,
+            populated: true,
+        };
+        let off = run(typed, 30);
+        assert!(off.iter().all(|look| look.label == 1.0), "{off:?}");
+        let focus: Vec<f32> = off.iter().map(|look| look.focus).collect();
+        let shown: Vec<f32> = off.iter().map(|look| look.placeholder).collect();
+        for seen in [&focus, &shown] {
+            assert!(seen[0] > 0.5, "{seen:?}");
+            assert!(seen.windows(2).all(|p| p[1] <= p[0]), "{seen:?}");
+            assert_eq!(seen[19], 0.0, "{seen:?}");
+        }
+        // Emptied while blurred: the label comes back down into the field.
+        let down = run(rest, 70);
+        assert!(down[0].label > 0.5, "{down:?}");
+        assert!(down[7].label <= 0.1, "{down:?}");
+        assert_eq!(down[24].label, 0.0, "{down:?}");
+        assert!(down.iter().all(|look| look.placeholder == 0.0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_button_press_ripples_morphs_and_fades_on_the_spec_clock() {
+        use crate::motion::{ControlEvent, ControlSpec};
+        let (mut chat, dir) = chat();
+        let t0 = Instant::now();
+        let spec = ControlSpec {
+            elevation: [1.0, 2.0, 1.0, 1.0],
+            ..ControlSpec::default()
+        };
+        chat.frame_at(COLS, ROWS, t0);
+        let rest = chat.control_look(7, spec);
+        assert_eq!(
+            (rest.hovered, rest.pressed, rest.elevation),
+            (0.0, 0.0, 1.0)
+        );
+        assert!(rest.ripples.is_empty());
+
+        // Hover: the state layer fades in on the effects spring (90 % in
+        // under 120 ms, no bounce); the lift takes 120 ms.
+        chat.control(7, ControlEvent::Hover(true));
+        chat.frame_at(COLS, ROWS, t0 + FRAME);
+        chat.control_look(7, spec);
+        let mut fade = Vec::new();
+        for n in 2..=20 {
+            chat.frame_at(COLS, ROWS, t0 + n * FRAME);
+            let look = chat.control_look(7, spec);
+            fade.push(look.hovered);
+            if n == 2 {
+                assert!(look.elevation > 1.0 && look.elevation < 2.0);
+            }
+        }
+        assert!(
+            fade[0] > 0.0 && fade[0] < 0.5,
+            "a fade, not a cut: {fade:?}"
+        );
+        assert!(fade.windows(2).all(|p| p[1] >= p[0]), "{fade:?}");
+        assert!(fade[6] >= 0.9, "90 % by 128 ms: {fade:?}");
+        assert_eq!(fade[18], 1.0, "at rest by 320 ms: {fade:?}");
+        let hovered = chat.control_look(7, spec);
+        assert_eq!(hovered.elevation, 2.0);
+
+        // Press at the left edge: a ripple from there, the shape on its way.
+        chat.control(
+            7,
+            ControlEvent::Press {
+                at: (4.0, 20.0),
+                size: (120.0, 40.0),
+            },
+        );
+        let pressed_at = t0 + 11 * FRAME;
+        chat.frame_at(COLS, ROWS, pressed_at);
+        let first = chat.control_look(7, spec);
+        assert_eq!(first.ripples.len(), 1);
+        assert_eq!(first.ripples[0].at, (4.0, 20.0));
+        assert_eq!(first.ripples[0].alpha, 0.0, "starts invisible");
+        chat.frame_at(COLS, ROWS, pressed_at + FRAME * 2);
+        let mid = chat.control_look(7, spec);
+        assert!(mid.pressed > 0.0 && mid.pressed < 1.0, "{}", mid.pressed);
+        let ripple = mid.ripples[0];
+        assert!(ripple.alpha > 0.3 && ripple.alpha < 0.6, "{}", ripple.alpha);
+        assert!(ripple.grow > 0.0 && ripple.grow < 1.0);
+
+        // A quick release: the ripple still grows fully, then fades out.
+        chat.control(7, ControlEvent::Release);
+        assert!(chat.animating(), "a released ripple keeps frames coming");
+        let mut t = pressed_at + FRAME * 2;
+        let mut last = ripple.alpha;
+        for _ in 0..12 {
+            t += FRAME;
+            chat.frame_at(COLS, ROWS, t);
+            let look = chat.control_look(7, spec);
+            if let Some(r) = look.ripples.first()
+                && r.grow < 1.0
+            {
+                assert!(r.alpha >= last, "no fade before fully grown");
+                last = r.alpha;
+            }
+        }
+        for _ in 0..12 {
+            t += FRAME;
+            chat.frame_at(COLS, ROWS, t);
+            chat.control_look(7, spec);
+        }
+        let done = chat.control_look(7, spec);
+        assert!(done.ripples.is_empty(), "the ripple is gone");
+        assert!(!chat.animating(), "and nothing keeps frames coming");
+        assert_eq!(done.pressed, 0.0, "back to the resting shape");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn expressive_shapes_morph_on_fast_spatial_and_keep_momentum() {
+        use crate::motion::{ControlEvent, ControlSpec, Corners, Shapes, Spring};
+        let (mut chat, dir) = chat();
+        let t0 = Instant::now();
+        // A list item's: 4 at rest, 12 hovered, 16 pressed (Compose).
+        let spec = ControlSpec {
+            shape: Spring::FAST_SPATIAL,
+            shapes: Some(Shapes {
+                hovered: Corners::all(12.0),
+                focused: Corners::all(16.0),
+                pressed: Corners::all(16.0),
+                checked: Corners::all(16.0),
+                ..Shapes::fixed(Corners::new(16.0, 4.0))
+            }),
+            ..ControlSpec::default()
+        };
+        chat.frame_at(COLS, ROWS, t0);
+        assert_eq!(chat.control_look(5, spec).corners, Corners::new(16.0, 4.0));
+        chat.control(5, ControlEvent::Hover(true));
+        let mut tops = Vec::new();
+        let mut bottoms = Vec::new();
+        for n in 1..=40 {
+            chat.frame_at(COLS, ROWS, t0 + n * FRAME);
+            let look = chat.control_look(5, spec);
+            tops.push(look.corners.top);
+            bottoms.push(look.corners.bottom);
+        }
+        // Each side springs to its own target: the top moves in, the bottom
+        // out, past 12 by fast spatial's overshoot, then settles.
+        assert!(bottoms[1] > 4.0 && bottoms[1] < 12.0, "{bottoms:?}");
+        let over = bottoms.iter().cloned().fold(0.0, f32::max);
+        assert!(over > 12.3 && over < 13.2, "overshoot {over}");
+        assert!(tops.iter().cloned().fold(16.0, f32::min) < 11.9);
+        assert!(bottoms[7] > 4.0 + 0.9 * 8.0, "90 % in 120 ms: {bottoms:?}");
+        assert_eq!(bottoms.last(), Some(&12.0));
+        assert_eq!(tops.last(), Some(&12.0));
+        // Pressed wins over hovered; the release springs back from where it is.
+        chat.control(
+            5,
+            ControlEvent::Press {
+                at: (1.0, 1.0),
+                size: (100.0, 56.0),
+            },
+        );
+        let t1 = t0 + 41 * FRAME;
+        chat.frame_at(COLS, ROWS, t1);
+        chat.control_look(5, spec);
+        chat.frame_at(COLS, ROWS, t1 + 2 * FRAME);
+        let mid = chat.control_look(5, spec).corners.bottom;
+        assert!(mid > 12.0 && mid < 16.0, "{mid}");
+        chat.control(5, ControlEvent::Release);
+        chat.frame_at(COLS, ROWS, t1 + 3 * FRAME);
+        let turned = chat.control_look(5, spec).corners.bottom;
+        assert!(turned > mid, "keeps its momentum: {mid} → {turned}");
+        chat.control(5, ControlEvent::Hover(false));
+        for n in 4..=40 {
+            chat.frame_at(COLS, ROWS, t1 + n * FRAME);
+            chat.control_look(5, spec);
+        }
+        assert_eq!(chat.control_look(5, spec).corners, Corners::new(16.0, 4.0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keyboard_focus_rings_grow_then_settle() {
+        use crate::motion::{ControlSpec, RING_ACTIVE, RING_WIDTH};
+        let (mut chat, dir) = chat();
+        let t0 = Instant::now();
+        let mut spec = ControlSpec::default();
+        chat.frame_at(COLS, ROWS, t0);
+        assert_eq!(chat.control_look(3, spec).ring, None);
+        spec.focused = true;
+        assert_eq!(chat.control_look(3, spec).ring, Some(0.0));
+        let ring_at = |chat: &mut Chat, ms: u64| {
+            chat.frame_at(COLS, ROWS, t0 + Duration::from_millis(ms));
+            chat.control_look(3, spec).ring.unwrap()
+        };
+        let mut peak = 0.0f32;
+        let mut ms = 0;
+        while ms < 700 {
+            ms += 16;
+            peak = peak.max(ring_at(&mut chat, ms));
+        }
+        assert!((peak - RING_ACTIVE).abs() < 0.5, "peak {peak}");
+        assert_eq!(ring_at(&mut chat, ms + 16), RING_WIDTH);
+        spec.focused = false;
+        assert_eq!(chat.control_look(3, spec).ring, None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Body of an answer with `n` numbered lines.
@@ -5943,7 +6398,7 @@ mod motion_tests {
     }
 
     #[test]
-    fn effort_panel_opens_with_menu_in_and_its_thumb_glides() {
+    fn effort_menu_scales_and_fades_on_the_menu_springs_both_ways() {
         let (chat, dir) = chat();
         let mut chat = chat.with_pixels();
         let mut t = Instant::now();
@@ -5952,38 +6407,40 @@ mod motion_tests {
         t += FRAME;
         let panel = |frame: &Frame| frame.chrome.as_ref().unwrap().effort.clone().unwrap();
         let first = panel(&chat.frame_at(COLS, ROWS, t));
-        assert!(first.open < 0.5, "starts closed: {}", first.open);
-        let frames = settle(&mut chat, &mut t, 30);
+        assert!(first.expanded);
+        assert!(first.open < 0.5 && first.scale < 0.9, "{first:?}");
+        let frames = settle(&mut chat, &mut t, 40);
+        // Opacity on fast effects: no bounce, in well under 120 ms.
         let opens: Vec<f32> = frames.iter().map(|f| panel(f).open).collect();
         assert!(opens.windows(2).all(|p| p[1] >= p[0]), "{opens:?}");
+        assert!(opens[5] > 0.9, "{opens:?}");
+        // Scale on fast spatial: 0.8 → past 1 → 1.
+        let scales: Vec<f32> = frames.iter().map(|f| panel(f).scale).collect();
+        let peak = scales.iter().cloned().fold(0.0, f32::max);
+        assert!(peak > 1.0 && peak < 1.03, "{scales:?}");
+        assert!(scales[6] > 0.8 + 0.9 * 0.2, "90 % in 120 ms: {scales:?}");
+        let last = panel(frames.last().unwrap());
+        assert_eq!((last.open, last.scale), (1.0, 1.0));
         assert!(
-            frames.len() * 16 <= 160,
-            "menu-in: {} ms",
+            frames.len() * 16 <= 400,
+            "settles: {} ms",
             frames.len() * 16
         );
-        assert_eq!(panel(frames.last().unwrap()).open, 1.0);
-        // A new level: the thumb glides there, never jumps or reverses.
-        let from = panel(frames.last().unwrap()).thumb;
-        chat.key(Key::Right, Mods::default());
+        // ↓ picks the next level; the menu stays.
+        let before = last.selected;
+        chat.key(Key::Down, Mods::default());
         t += FRAME;
-        let start = panel(&chat.frame_at(COLS, ROWS, t)).thumb;
-        assert!(
-            (start - from).abs() < 0.2,
-            "starts where it was: {from} → {start}"
-        );
-        let frames = settle(&mut chat, &mut t, 30);
-        let thumbs: Vec<f32> = frames.iter().map(|f| panel(f).thumb).collect();
-        let end = *thumbs.last().unwrap();
-        assert!(end > from, "moved right: {from} → {end}");
-        assert!(thumbs.windows(2).all(|p| p[1] >= p[0]), "{thumbs:?}");
-        assert!(frames.len() * 16 <= 220, "resize: {} ms", frames.len() * 16);
-        let ended = panel(frames.last().unwrap());
-        let n = ended.levels.len() - 1;
-        assert_eq!(
-            ended.thumb,
-            ended.selected as f32 / n as f32,
-            "ends exactly"
-        );
+        let after = panel(&chat.frame_at(COLS, ROWS, t));
+        assert_eq!(after.selected, (before + 1).min(after.levels.len() - 1));
+        assert!(after.expanded);
+        // Esc: the same springs back to 0.8 and transparent.
+        chat.key(Key::Esc, Mods::default());
+        t += FRAME;
+        assert!(!panel(&chat.frame_at(COLS, ROWS, t)).expanded);
+        let frames = settle(&mut chat, &mut t, 40);
+        let gone = panel(frames.last().unwrap());
+        assert_eq!(gone.open, 0.0);
+        assert!((gone.scale - 0.8).abs() < 1e-6, "{}", gone.scale);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6262,7 +6719,7 @@ mod key_tests {
                 .map(|d| d.title.clone())
                 .collect()
         };
-        assert_eq!(titles(&Chat::open_at(dir.clone(), a)), ["alpha"]);
+        assert!(titles(&Chat::open_at(dir.clone(), a)).contains(&"alpha".into()));
         assert!(!titles(&Chat::open_at(dir.clone(), b)).contains(&"alpha".into()));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6576,18 +7033,47 @@ mod key_tests {
         chat.key(Key::Char('n'), CTRL);
         assert_eq!(sessions(&chat).len(), 2, "one empty session at most");
         drop(chat);
-        // Reopening: the empty unnamed one is gone, the used one opens.
+        // Reopening: the empty unnamed one is gone, the used one is kept,
+        // and a fresh session opens instead of resuming it.
         let reopened = Chat::open_in(dir.clone());
         let docs = reopened.client.app().docs();
+        let titles: Vec<_> = docs.iter().map(|d| d.title.clone()).collect();
+        assert_eq!(docs.len(), 2, "{titles:?}");
+        assert!(titles.iter().any(|t| t == "first question"), "{titles:?}");
+        let shown = reopened.client.app().selected().unwrap();
+        assert!(shown.body.trim().is_empty(), "starts fresh");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resume_opens_the_last_used_session() {
+        let (mut first, dir) = chat();
+        first.paste("earlier question");
+        first.key(Key::Enter, NONE);
+        first.key(Key::Esc, NONE);
+        idle(&mut first);
+        drop(first);
+        let resumed = Chat::open_in(dir.clone()).resumed();
+        let docs = resumed.client.app().docs();
+        assert_eq!(docs.len(), 1, "no leftover empty session");
         assert_eq!(
-            docs.len(),
-            1,
-            "{:?}",
-            docs.iter().map(|d| &d.title).collect::<Vec<_>>()
+            resumed.client.app().selected().unwrap().title,
+            "earlier question"
         );
-        assert_eq!(
-            reopened.client.app().selected().unwrap().title,
-            "first question"
+        // Nothing to resume: stays on a fresh session.
+        let _ = std::fs::remove_dir_all(&dir);
+        let (empty, dir) = chat();
+        drop(empty);
+        let fresh = Chat::open_in(dir.clone()).resumed();
+        assert!(
+            fresh
+                .client
+                .app()
+                .selected()
+                .unwrap()
+                .body
+                .trim()
+                .is_empty()
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6623,7 +7109,13 @@ mod key_tests {
             .clone();
         assert_eq!(doc.title, "why is the build slow");
         chat.key(Key::Char('s'), CTRL);
-        let label = chat.picker.matches()[0].label.clone();
+        let label = chat
+            .picker
+            .matches()
+            .iter()
+            .map(|m| m.label.clone())
+            .find(|l| l.starts_with("why is the build slow"))
+            .unwrap();
         assert!(label.ends_with("3d ago"), "naming it kept its age: {label}");
         let _ = std::fs::remove_dir_all(dir);
     }

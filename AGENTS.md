@@ -42,9 +42,57 @@ Animated today: transcript scroll (glide, keeps its place when content arrives
 while scrolled up), new rows (fade in), session switch, relayout, rewind and the welcome giving
 way to the chat (fade in), the window's sidebar (glides open and shut, ctrl+b),
 popup (zeron's dialog-in), effort panel (menu-in, its thumb glides), hover plates (fade), picker highlight (fades onto the item),
-notices (fade in), ctx meter (counts), prompt box height (grows or shrinks a row
+notices (fade in), Material component states (`motion::Controls`: state layers,
+ripples, shape morphs, elevation, focus ring, on the spec's springs and
+curves), the composer's text field (`Controls::field`: label floats, indicator
+thickens and colours, placeholder fades), ctx meter (counts), prompt box height (grows or shrinks a row
 at a time), scrollbar thumb (follows the shown scroll), image previews (fade
 in with their rows; real pictures follow the same fade and smooth scroll).
+
+## Window: only to-spec Material 3 Expressive components
+
+Everything in the gpui window is built from Material 3 Expressive components
+that match the spec, not from divs styled to look like one.
+
+- **Canonical values only.** Sizes, paddings, shapes, colours, type, elevation,
+  state-layer opacities and motion come from the AndroidX Compose Material 3
+  tokens (`androidx.compose.material3.tokens.*`) and the component's
+  `*Defaults`, with material-web where Compose has no answer (focus ring,
+  shadow formula). Name the token next to each value. Never eyeball, round or
+  "tune" a value. If the spec has no answer, say so in a comment and choose the
+  nearest spec value.
+- **One module per component** (`crates/ui-gpui/src/m3_*.rs`), with tests that
+  pin its token tables. Roles come from `m3::Scheme`, type from `m3::font`,
+  shapes, spacing and elevation from `m3::{shape, space, level}`, and icons
+  are Material Symbols (`m3::icon`).
+- **States are the component's.** Hover, focus, press, ripple, shape morph,
+  elevation and the focus ring go through `m3_state` (`Ui`, `interact`,
+  `overlay`), and `motion::Controls` animates them. No `.hover()` or
+  `.active()` styling, and no ad-hoc tints.
+- **Accessible like the spec:** a 48 px minimum target, a role and a label,
+  toggles with `aria_toggled`, and keyboard focus (F6 / Tab on components,
+  Enter / Space activate, Escape back to the composer).
+- **No look-alikes.** If the GUI needs something the spec lacks, compose it
+  from spec components or ask first. When you replace a look-alike, delete it.
+  Do not keep restyled leftovers.
+- **Build on the kit in `m3_state`, not from scratch.** A new component is its
+  token tables plus:
+  - `Act` holding its `aria`, `on_click`, `keyshortcuts` and `enabled`,
+    with `act_setters!()` in its `impl`;
+  - `Control::new(key, act, ui, cx)` for its focus handle and focus state;
+    `control.look(ui, spec)` for its animated look; `control.root()` or
+    `.target(zoom)` (the 48 dp target); and `control.wire(el, ui, label,
+    semantics)` for keys, role and label;
+  - `Overlay::new(..)` (`.outline`, `.zoom`) for its state layer, ripple and
+    focus ring;
+  - its colour struct mixed with `mix_tones!(Colors { .. } keep { .. })`;
+  - text set with `.type_style(m3::font::ROLE, zoom)` and `.one_line()`;
+  - editable text drawn with `m3_text_field::input_row`.
+- **Check it in the gallery.** `scripts/dev.sh ./target/debug/shroom-gpui
+  --gallery` (`m3_gallery.rs`) shows every component at rest, focused
+  (pinned with `Ui::with_pinned_focus`), selected, toggled and disabled, with
+  hover and press from the pointer. Add each new component and state there,
+  and screenshot it before you report.
 
 ## Other rules
 

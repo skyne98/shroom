@@ -33,7 +33,6 @@ gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "b564a34413bb7ef
     "font-kit",
     "runtime_shaders",
 ] }
-gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "59f89243cea79dd70eb7a619b3930c374ef6958a" }
 
 [profile.dev.package."*"]
 # gpui and wasmtime are unusable unoptimized; match zed's approach.
